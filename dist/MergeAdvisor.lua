@@ -110,55 +110,37 @@ end)()
 
 -- MODULE: src/core/InventoryReader.lua
 local InventoryReader = (function()
--- InventoryReader
--- Migrasi scanner inventory dari MergeAdvisor v10.2.0.
--- Read-only: tidak mengubah Tool, atribut, atau tag game.
+-- InventoryReader.lua
+-- Scanner read-only + live change watcher untuk inventory AnimalTool.
 
 local InventoryReader = {}
 
-local ATTRIBUTES = {
-    "AnimalName",
-    "WeightKg",
-    "Variant",
-    "Mutation",
-    "SizeMult",
-    "Enchant",
-}
-
 local function readValue(tool, key)
-    local ok, value = pcall(function()
-        return tool:GetAttribute(key)
-    end)
-
-    if ok and value ~= nil then
-        return value
-    end
-
+    local ok, value = pcall(function() return tool:GetAttribute(key) end)
+    if ok and value ~= nil then return value end
     local child = tool:FindFirstChild(key, true)
-
     if child and child:IsA("ValueBase") then
-        return child.Value
+        local success, result = pcall(function() return child.Value end)
+        if success then return result end
     end
-
     return nil
 end
 
 local function isOwnedTool(tool, player)
-    if not tool or not tool:IsA("Tool") then
-        return false
-    end
-
-    local backpack = player:FindFirstChildOfClass("Backpack")
-        or player:FindFirstChild("Backpack")
-
+    if not tool or not tool:IsA("Tool") then return false end
+    local backpack = player:FindFirstChildOfClass("Backpack") or player:FindFirstChild("Backpack")
     local character = player.Character
-
     return (backpack and tool:IsDescendantOf(backpack))
         or (character and tool:IsDescendantOf(character))
 end
 
 local function validString(value)
     return type(value) == "string" and value ~= ""
+end
+
+local function safeFullName(instance)
+    local ok, result = pcall(function() return instance:GetFullName() end)
+    return ok and result or (instance and instance.Name or "Unknown")
 end
 
 function InventoryReader.ReadValue(tool, key)
@@ -171,12 +153,7 @@ function InventoryReader.Scan(player, collectionService, incomeCalculator, confi
     assert(incomeCalculator, "IncomeCalculator wajib tersedia")
     assert(configs, "Game configs wajib tersedia")
 
-    local pets = {}
-    local diagnostics = {}
-    local tools = {}
-    local seen = {}
-
-    -- Sumber resmi inventory: tag AnimalTool.
+    local pets, diagnostics, tools, seen = {}, {}, {}, {}
     for _, tool in ipairs(collectionService:GetTagged("AnimalTool")) do
         if isOwnedTool(tool, player) and not seen[tool] then
             seen[tool] = true
@@ -186,25 +163,16 @@ function InventoryReader.Scan(player, collectionService, incomeCalculator, confi
 
     for _, tool in ipairs(tools) do
         local tagged = false
-
-        pcall(function()
-            tagged = collectionService:HasTag(tool, "AnimalTool")
-        end)
-
+        pcall(function() tagged = collectionService:HasTag(tool, "AnimalTool") end)
         if tagged then
             local name = readValue(tool, "AnimalName")
             local weight = readValue(tool, "WeightKg")
-
             if not validString(name) then
                 local fallback = tool.Name
-
-                if validString(fallback) and fallback ~= "Tool" then
-                    name = fallback
-                end
+                if validString(fallback) and fallback ~= "Tool" then name = fallback end
             end
 
             local reason
-
             if not validString(name) then
                 reason = "AnimalName dan nama Tool tidak tersedia"
             elseif type(weight) ~= "number" or weight <= 0 then
@@ -214,31 +182,30 @@ function InventoryReader.Scan(player, collectionService, incomeCalculator, confi
                 local mutation = readValue(tool, "Mutation")
                 local size = readValue(tool, "SizeMult")
                 local enchant = readValue(tool, "Enchant")
-
                 local pet = {
-                    name = name,
-                    kg = weight,
+                    name = name, AnimalName = name, Name = name,
+                    kg = weight, WeightKg = weight,
                     var = validString(variant) and variant or nil,
+                    Variant = validString(variant) and variant or nil,
                     mut = validString(mutation) and mutation or nil,
+                    Mutation = validString(mutation) and mutation or nil,
                     size = type(size) == "number" and size or nil,
+                    SizeMult = type(size) == "number" and size or nil,
                     enchant = validString(enchant) and enchant or nil,
-                    tool = tool,
+                    Enchant = validString(enchant) and enchant or nil,
+                    tool = tool, Tool = tool,
                 }
 
                 local ok, income = pcall(function()
                     return incomeCalculator.CalculateFromGame(
-                        configs,
-                        pet.name,
-                        pet.size,
-                        pet.mut,
-                        pet.kg,
-                        pet.var,
-                        pet.enchant
+                        configs, name, pet.size, pet.mut, weight, pet.var, pet.enchant
                     )
                 end)
-
                 if ok and type(income) == "number" and income >= 0 then
                     pet.income = income
+                    pet.Income = income
+                    pet.CashPerSecond = income
+                    pet.PlacedCashPerSecond = income
                     table.insert(pets, pet)
                 else
                     reason = "Income gagal dihitung: " .. tostring(income)
@@ -246,15 +213,122 @@ function InventoryReader.Scan(player, collectionService, incomeCalculator, confi
             end
 
             if reason then
-                table.insert(
-                    diagnostics,
-                    "[SKIP] " .. tool:GetFullName() .. " | " .. reason
-                )
+                table.insert(diagnostics, "[SKIP] " .. safeFullName(tool) .. " | " .. reason)
             end
         end
     end
 
     return pets, diagnostics, #tools
+end
+
+-- Live watcher: perubahan atribut/ValueObject, isi Backpack/Character,
+-- serta tag AnimalTool memicu scan ulang dengan debounce.
+function InventoryReader.Watch(player, collectionService, callback, debounceSeconds)
+    assert(player and collectionService and type(callback) == "function",
+        "Watch membutuhkan player, CollectionService, dan callback")
+
+    local delaySeconds = tonumber(debounceSeconds) or 0.5
+    local alive, pending = true, false
+    local connections, toolConnections = {}, {}
+
+    local function connect(signal, handler, bucket)
+        if not signal then return end
+        local ok, connection = pcall(function() return signal:Connect(handler) end)
+        if ok and connection then table.insert(bucket or connections, connection) end
+    end
+
+    local function schedule()
+        if not alive or pending then return end
+        pending = true
+        task.delay(delaySeconds, function()
+            pending = false
+            if alive then
+                local ok, err = pcall(callback)
+                if not ok then warn("[MergeAdvisor] Auto-refresh gagal: " .. tostring(err)) end
+            end
+        end)
+    end
+
+    local function watchTool(tool)
+        if not tool or not tool:IsA("Tool") or toolConnections[tool] then return end
+        local bucket, watchedValues = {}, {}
+        toolConnections[tool] = bucket
+
+        local function watchValue(instance)
+            if not instance:IsA("ValueBase") or watchedValues[instance] then return end
+            watchedValues[instance] = true
+            connect(instance.Changed, schedule, bucket)
+        end
+
+        connect(tool.AttributeChanged, schedule, bucket)
+        connect(tool.DescendantAdded, function(instance)
+            watchValue(instance)
+            schedule()
+        end, bucket)
+        connect(tool.AncestryChanged, schedule, bucket)
+        for _, descendant in ipairs(tool:GetDescendants()) do watchValue(descendant) end
+    end
+
+    local function unwatchTool(tool)
+        local bucket = toolConnections[tool]
+        if not bucket then return end
+        for _, connection in ipairs(bucket) do
+            pcall(function() connection:Disconnect() end)
+        end
+        toolConnections[tool] = nil
+    end
+
+    local function watchContainer(container)
+        if not container then return end
+        connect(container.ChildAdded, function(child)
+            if child:IsA("Tool") then watchTool(child) end
+            schedule()
+        end)
+        connect(container.ChildRemoved, schedule)
+        connect(container.DescendantAdded, function(instance)
+            if instance:IsA("Tool") then watchTool(instance) end
+        end)
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("Tool") then watchTool(child) end
+        end
+    end
+
+    local backpack = player:FindFirstChildOfClass("Backpack") or player:FindFirstChild("Backpack")
+    watchContainer(backpack)
+    watchContainer(player.Character)
+
+    connect(player.ChildAdded, function(child)
+        if child:IsA("Backpack") then watchContainer(child); schedule() end
+    end)
+    connect(player.CharacterAdded, function(character)
+        watchContainer(character)
+        schedule()
+    end)
+    connect(collectionService:GetInstanceAddedSignal("AnimalTool"), function(instance)
+        if isOwnedTool(instance, player) then watchTool(instance) end
+        schedule()
+    end)
+    connect(collectionService:GetInstanceRemovedSignal("AnimalTool"), function(instance)
+        unwatchTool(instance)
+        schedule()
+    end)
+
+    for _, tool in ipairs(collectionService:GetTagged("AnimalTool")) do
+        if isOwnedTool(tool, player) then watchTool(tool) end
+    end
+
+    local handle = {}
+    function handle.Disconnect()
+        if not alive then return end
+        alive = false
+        for _, connection in ipairs(connections) do
+            pcall(function() connection:Disconnect() end)
+        end
+        for tool in pairs(toolConnections) do unwatchTool(tool) end
+        table.clear(connections)
+    end
+    handle.Destroy = handle.Disconnect
+    return handle
 end
 
 return InventoryReader
@@ -559,15 +633,13 @@ end)()
 -- MODULE: src/ui/MainWindow.lua
 local MainWindow = (function()
 -- MainWindow.lua
--- GUI diagnostik MergeAdvisor untuk Delta Executor.
+-- GUI diagnostik dengan output scrollable untuk inventory panjang.
 
 local MainWindow = {}
 
 function MainWindow.Create(playerGui)
     local old = playerGui:FindFirstChild("MergeAdvisorModular")
-    if old then
-        old:Destroy()
-    end
+    if old then old:Destroy() end
 
     local gui = Instance.new("ScreenGui")
     gui.Name = "MergeAdvisorModular"
@@ -578,20 +650,15 @@ function MainWindow.Create(playerGui)
 
     local frame = Instance.new("Frame")
     frame.Name = "Main"
-    frame.Size = UDim2.fromOffset(340, 390)
-    frame.Position = UDim2.new(0.5, -170, 0.5, -195)
+    frame.Size = UDim2.fromOffset(350, 430)
+    frame.Position = UDim2.new(0.5, -175, 0.5, -215)
     frame.BackgroundColor3 = Color3.fromRGB(23, 26, 34)
     frame.BorderSizePixel = 0
     frame.Parent = gui
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 10)
-    corner.Parent = frame
-
-    local stroke = Instance.new("UIStroke")
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+    local stroke = Instance.new("UIStroke", frame)
     stroke.Color = Color3.fromRGB(65, 76, 96)
     stroke.Thickness = 1
-    stroke.Parent = frame
 
     local title = Instance.new("TextLabel")
     title.Size = UDim2.new(1, -20, 0, 38)
@@ -612,34 +679,38 @@ function MainWindow.Create(playerGui)
     status.Text = "Status: Starting..."
     status.TextColor3 = Color3.fromRGB(255, 205, 100)
     status.Font = Enum.Font.Gotham
-    status.TextSize = 12
+    status.TextSize = 11
     status.TextXAlignment = Enum.TextXAlignment.Left
+    status.TextTruncate = Enum.TextTruncate.AtEnd
     status.Parent = frame
+
+    local scroll = Instance.new("ScrollingFrame")
+    scroll.Name = "ReportScroll"
+    scroll.Position = UDim2.fromOffset(10, 72)
+    scroll.Size = UDim2.new(1, -20, 1, -125)
+    scroll.BackgroundColor3 = Color3.fromRGB(15, 18, 25)
+    scroll.BorderSizePixel = 0
+    scroll.ScrollBarThickness = 5
+    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroll.ScrollingDirection = Enum.ScrollingDirection.Y
+    scroll.Parent = frame
+    Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 6)
 
     local output = Instance.new("TextLabel")
     output.Name = "Output"
-    output.Size = UDim2.new(1, -20, 1, -125)
-    output.Position = UDim2.fromOffset(10, 72)
-    output.BackgroundColor3 = Color3.fromRGB(15, 18, 25)
-    output.BorderSizePixel = 0
+    output.BackgroundTransparency = 1
+    output.Position = UDim2.fromOffset(8, 7)
+    output.Size = UDim2.new(1, -16, 0, 0)
+    output.AutomaticSize = Enum.AutomaticSize.Y
     output.TextColor3 = Color3.fromRGB(215, 225, 240)
     output.Font = Enum.Font.Code
-    output.TextSize = 12
+    output.TextSize = 11
     output.TextXAlignment = Enum.TextXAlignment.Left
     output.TextYAlignment = Enum.TextYAlignment.Top
     output.TextWrapped = true
     output.Text = "Menunggu data..."
-    output.Parent = frame
-
-    local outputCorner = Instance.new("UICorner")
-    outputCorner.CornerRadius = UDim.new(0, 6)
-    outputCorner.Parent = output
-
-    local padding = Instance.new("UIPadding")
-    padding.PaddingTop = UDim.new(0, 8)
-    padding.PaddingLeft = UDim.new(0, 8)
-    padding.PaddingRight = UDim.new(0, 8)
-    padding.Parent = output
+    output.Parent = scroll
 
     local function makeButton(name, text, x, width)
         local button = Instance.new("TextButton")
@@ -653,77 +724,56 @@ function MainWindow.Create(playerGui)
         button.Font = Enum.Font.GothamBold
         button.TextSize = 12
         button.Parent = frame
-
-        local c = Instance.new("UICorner")
-        c.CornerRadius = UDim.new(0, 6)
-        c.Parent = button
-
+        Instance.new("UICorner", button).CornerRadius = UDim.new(0, 6)
         return button
     end
 
-    local refresh = makeButton("Refresh", "REFRESH", 10, 155)
-    local copy = makeButton("Copy", "COPY REPORT", 175, 155)
+    local refresh = makeButton("Refresh", "REFRESH", 10, 160)
+    local copy = makeButton("Copy", "COPY REPORT", 180, 160)
 
-    local dragging = false
-    local dragStart
-    local startPosition
-
-    title.InputBegan:Connect(function(input)
+    local UserInputService = game:GetService("UserInputService")
+    local dragging, dragStart, startPosition = false, nil, nil
+    local dragConnections = {}
+    table.insert(dragConnections, title.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
             or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
             dragStart = input.Position
             startPosition = frame.Position
         end
-    end)
-
-    title.InputEnded:Connect(function(input)
+    end))
+    table.insert(dragConnections, title.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-        end
-    end)
-
-    game:GetService("UserInputService").InputChanged:Connect(function(input)
+            or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
+    end))
+    table.insert(dragConnections, UserInputService.InputChanged:Connect(function(input)
         if not dragging then return end
-
         if input.UserInputType == Enum.UserInputType.MouseMovement
             or input.UserInputType == Enum.UserInputType.Touch then
             local delta = input.Position - dragStart
-            frame.Position = UDim2.new(
-                startPosition.X.Scale,
-                startPosition.X.Offset + delta.X,
-                startPosition.Y.Scale,
-                startPosition.Y.Offset + delta.Y
-            )
+            frame.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
         end
-    end)
+    end))
 
     local api = {}
-
     function api.SetStatus(text, success)
         status.Text = "Status: " .. tostring(text)
-        status.TextColor3 = success
-            and Color3.fromRGB(120, 230, 150)
+        status.TextColor3 = success and Color3.fromRGB(120, 230, 150)
             or Color3.fromRGB(255, 190, 100)
     end
-
     function api.SetText(text)
         output.Text = tostring(text)
+        scroll.CanvasPosition = Vector2.new(0, 0)
     end
-
-    function api.OnRefresh(callback)
-        refresh.Activated:Connect(callback)
-    end
-
-    function api.OnCopy(callback)
-        copy.Activated:Connect(callback)
-    end
-
+    function api.OnRefresh(callback) refresh.Activated:Connect(callback) end
+    function api.OnCopy(callback) copy.Activated:Connect(callback) end
     function api.Destroy()
+        for _, connection in ipairs(dragConnections) do
+            pcall(function() connection:Disconnect() end)
+        end
         gui:Destroy()
     end
-
     return api
 end
 
@@ -733,132 +783,108 @@ end)()
 -- MODULE: src/core/Bootstrap.lua
 local Bootstrap = (function()
 -- Bootstrap.lua
--- Penghubung modul utama MergeAdvisor.
+-- Penghubung konfigurasi, inventory, live refresh, dan GUI.
 
 local Bootstrap = {}
 
 local function safeString(value)
-    if value == nil then
-        return "-"
-    end
-
+    if value == nil then return "-" end
     return tostring(value)
 end
 
 local function getIncome(animal)
-    return tonumber(
-        animal.Income
-        or animal.CashPerSecond
-        or animal.PlacedCashPerSecond
-        or animal.income
-    ) or 0
+    return tonumber(animal.Income or animal.CashPerSecond
+        or animal.PlacedCashPerSecond or animal.income) or 0
 end
 
 local function getAnimalName(animal)
-    return safeString(
-        animal.AnimalName
-        or animal.Name
-        or animal.name
-        or animal.ToolName
-    )
+    return safeString(animal.AnimalName or animal.Name or animal.name or animal.ToolName)
 end
 
 local function formatIncome(value)
-    if value >= 1e12 then
-        return string.format("%.2fT/s", value / 1e12)
-    elseif value >= 1e9 then
-        return string.format("%.2fB/s", value / 1e9)
-    elseif value >= 1e6 then
-        return string.format("%.2fM/s", value / 1e6)
-    elseif value >= 1e3 then
-        return string.format("%.2fK/s", value / 1e3)
-    end
-
+    if value >= 1e12 then return string.format("%.2fT/s", value / 1e12)
+    elseif value >= 1e9 then return string.format("%.2fB/s", value / 1e9)
+    elseif value >= 1e6 then return string.format("%.2fM/s", value / 1e6)
+    elseif value >= 1e3 then return string.format("%.2fK/s", value / 1e3) end
     return string.format("%.2f/s", value)
+end
+
+local function sortedErrorMessages(errors, prefix)
+    local result, keys = {}, {}
+    if type(errors) ~= "table" then return result end
+    for key in pairs(errors) do table.insert(keys, key) end
+    table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+    for _, key in ipairs(keys) do
+        local value = errors[key]
+        if type(value) == "table" then
+            table.insert(result, (prefix or "") .. tostring(key) .. ": "
+                .. safeString(value.message or value.error or value))
+        else
+            table.insert(result, (prefix or "") .. tostring(key) .. ": " .. safeString(value))
+        end
+    end
+    return result
 end
 
 function Bootstrap.Start(options)
     options = options or {}
-
     local modules = options.Modules or {}
-
-    local ConfigLoader = assert(
-        modules.GameConfigLoader,
-        "GameConfigLoader belum dimasukkan"
-    )
-
-    local InventoryReader = assert(
-        modules.InventoryReader,
-        "InventoryReader belum dimasukkan"
-    )
-
-    local IncomeCalculator = assert(
-        modules.IncomeCalculator,
-        "IncomeCalculator belum dimasukkan"
-    )
-
-    local MainWindow = assert(
-        modules.MainWindow,
-        "MainWindow belum dimasukkan"
-    )
+    local ConfigLoader = assert(modules.GameConfigLoader, "GameConfigLoader belum dimasukkan")
+    local InventoryReader = assert(modules.InventoryReader, "InventoryReader belum dimasukkan")
+    local IncomeCalculator = assert(modules.IncomeCalculator, "IncomeCalculator belum dimasukkan")
+    local MainWindow = assert(modules.MainWindow, "MainWindow belum dimasukkan")
 
     local Players = game:GetService("Players")
     local ReplicatedStorage = game:GetService("ReplicatedStorage")
     local CollectionService = game:GetService("CollectionService")
-
     local player = Players.LocalPlayer
     assert(player, "LocalPlayer tidak ditemukan")
 
     local playerGui = player:FindFirstChildOfClass("PlayerGui")
         or player:WaitForChild("PlayerGui", 10)
-
     assert(playerGui, "PlayerGui tidak ditemukan")
 
     local window = MainWindow.Create(playerGui)
-
     local controller = {
-        Configs = nil,
-        Animals = {},
-        Diagnostics = {},
-        LastReport = "",
-        Destroyed = false
+        Configs = nil, Animals = {}, Diagnostics = {},
+        TotalIncome = 0, LastReport = "", Destroyed = false,
+        Watcher = nil, Refreshing = false, RefreshQueued = false,
     }
 
-    local function makeReport(animals, diagnostics)
-        local lines = {}
+    local function makeReport(animals, diagnostics, totalIncome, scannedTools)
+        local lines = {
+            "MERGE ADVISOR",
+            "==============================",
+            "Player: " .. player.Name,
+            "Hewan terbaca: " .. #animals
+                .. (scannedTools and (" / " .. scannedTools .. " tagged") or ""),
+            "TOTAL INCOME: " .. formatIncome(totalIncome),
+            "",
+            "INVENTORY",
+            "------------------------------",
+        }
 
-        table.insert(lines, "MERGE ADVISOR")
-        table.insert(lines, "==============================")
-        table.insert(lines, "Player: " .. player.Name)
-        table.insert(lines, "Hewan terbaca: " .. #animals)
-        table.insert(lines, "")
-
-        table.insert(lines, "INVENTORY")
-        table.insert(lines, "------------------------------")
-
-        if #animals == 0 then
-            table.insert(lines, "Belum ada hewan yang terbaca.")
-        end
-
+        if #animals == 0 then table.insert(lines, "Belum ada hewan yang terbaca.") end
         for index, animal in ipairs(animals) do
             local name = getAnimalName(animal)
             local income = getIncome(animal)
-
-            table.insert(
-                lines,
-                string.format(
-                    "%02d. %s | %s",
-                    index,
-                    name,
-                    formatIncome(income)
-                )
-            )
+            local kg = tonumber(animal.WeightKg or animal.kg)
+            local variant = animal.Variant or animal.var or "-"
+            local mutation = animal.Mutation or animal.mut or "-"
+            local enchant = animal.Enchant or animal.enchant or "-"
+            local details = {}
+            if kg then table.insert(details, string.format("%.2f kg", kg)) end
+            if variant ~= "-" then table.insert(details, "Var " .. tostring(variant)) end
+            if mutation ~= "-" then table.insert(details, "Mut " .. tostring(mutation)) end
+            if enchant ~= "-" then table.insert(details, "Enc " .. tostring(enchant)) end
+            local suffix = #details > 0 and (" | " .. table.concat(details, " | ")) or ""
+            table.insert(lines, string.format("%02d. %s | %s%s",
+                index, name, formatIncome(income), suffix))
         end
 
         table.insert(lines, "")
         table.insert(lines, "DIAGNOSTIK")
         table.insert(lines, "------------------------------")
-
         if #diagnostics == 0 then
             table.insert(lines, "Tidak ada diagnostik tambahan.")
         else
@@ -866,69 +892,50 @@ function Bootstrap.Start(options)
                 table.insert(lines, "- " .. safeString(message))
             end
         end
-
         return table.concat(lines, "\n")
     end
 
     function controller.Refresh()
-        if controller.Destroyed then
-            return false, "Controller sudah dihentikan"
+        if controller.Destroyed then return false, "Controller sudah dihentikan" end
+        if controller.Refreshing then
+            controller.RefreshQueued = true
+            return false, "Refresh sedang berjalan"
         end
-
+        controller.Refreshing = true
         window.SetStatus("Memuat konfigurasi...", false)
 
         local configOK, configs, configErrors = pcall(function()
             return ConfigLoader.Load(ReplicatedStorage)
         end)
-
-        if not configOK then
-            local message = "ConfigLoader gagal: " .. safeString(configs)
+        if not configOK or type(configs) ~= "table" then
+            local messages = sortedErrorMessages(configErrors)
+            local message = "ConfigLoader gagal: "
+                .. safeString(configOK and "konfigurasi tidak valid" or configs)
+            if #messages == 0 and type(configs) == "table" then
+                messages = sortedErrorMessages(configs)
+            end
+            if #messages > 0 then message = message .. "\n" .. table.concat(messages, "\n") end
+            controller.Diagnostics = messages
+            controller.LastReport = message
+            window.SetText(message)
             window.SetStatus("Config gagal", false)
-            window.SetText(message)
-            controller.LastReport = message
-            return false, message
-        end
-
-        if type(configs) ~= "table" then
-            local message = "ConfigLoader tidak mengembalikan tabel konfigurasi"
-            window.SetStatus("Config tidak valid", false)
-            window.SetText(message)
-            controller.LastReport = message
+            controller.Refreshing = false
             return false, message
         end
 
         controller.Configs = configs
-
-        local diagnostics = {}
-
-        if type(configErrors) == "table" then
-            for _, message in ipairs(configErrors) do
-                table.insert(diagnostics, message)
-            end
-        end
-
-        if type(configs.Errors) == "table" then
-            for _, message in ipairs(configs.Errors) do
-                table.insert(diagnostics, message)
-            end
-        end
-
+        local diagnostics = sortedErrorMessages(configErrors, "[CONFIG] ")
         window.SetStatus("Membaca inventory...", false)
 
-        local scanOK, animals, scanDiagnostics = pcall(function()
-            return InventoryReader.Scan(
-                player,
-                CollectionService,
-                IncomeCalculator,
-                configs
-            )
+        local scanOK, animals, scanDiagnostics, scannedTools = pcall(function()
+            return InventoryReader.Scan(player, CollectionService, IncomeCalculator, configs)
         end)
-
         if not scanOK then
             local message = "InventoryReader gagal: " .. safeString(animals)
-            window.SetStatus("Scan gagal", false)
-            window.SetText(message)
             controller.LastReport = message
+            window.SetText(message)
+            window.SetStatus("Scan gagal", false)
+            controller.Refreshing = false
             return false, message
         end
 
@@ -936,63 +943,66 @@ function Bootstrap.Start(options)
             animals = {}
             table.insert(diagnostics, "InventoryReader tidak mengembalikan daftar hewan")
         end
-
         if type(scanDiagnostics) == "table" then
-            for _, message in ipairs(scanDiagnostics) do
-                table.insert(diagnostics, message)
-            end
+            for _, item in ipairs(scanDiagnostics) do table.insert(diagnostics, item) end
         end
 
-        table.sort(animals, function(a, b)
-            return getIncome(a) > getIncome(b)
-        end)
+        table.sort(animals, function(a, b) return getIncome(a) > getIncome(b) end)
+        local totalIncome = 0
+        for _, animal in ipairs(animals) do totalIncome = totalIncome + getIncome(animal) end
 
         controller.Animals = animals
         controller.Diagnostics = diagnostics
-
-        local report = makeReport(animals, diagnostics)
-
+        controller.TotalIncome = totalIncome
+        local report = makeReport(animals, diagnostics, totalIncome, scannedTools)
         controller.LastReport = report
         window.SetText(report)
-        window.SetStatus(
-            "Selesai - " .. #animals .. " hewan terbaca",
-            true
-        )
+        window.SetStatus("Selesai - " .. #animals .. " hewan | " .. formatIncome(totalIncome), true)
+        controller.Refreshing = false
 
+        if controller.RefreshQueued then
+            controller.RefreshQueued = false
+            task.defer(function()
+                if not controller.Destroyed then controller.Refresh() end
+            end)
+        end
         return true, report
     end
 
-    window.OnRefresh(function()
-        controller.Refresh()
-    end)
-
+    window.OnRefresh(function() controller.Refresh() end)
     window.OnCopy(function()
         local clipboard = setclipboard or toclipboard
-
         if type(clipboard) == "function" then
             local ok = pcall(clipboard, controller.LastReport)
-
-            if ok then
-                window.SetStatus("Report disalin", true)
-            else
-                window.SetStatus("Gagal menyalin report", false)
-            end
+            window.SetStatus(ok and "Report disalin" or "Gagal menyalin report", ok)
         else
             window.SetStatus("Clipboard tidak tersedia", false)
         end
     end)
 
-    function controller.Destroy()
-        if controller.Destroyed then
-            return
+    if type(InventoryReader.Watch) == "function" then
+        local ok, watcher = pcall(function()
+            return InventoryReader.Watch(player, CollectionService, function()
+                if not controller.Destroyed then controller.Refresh() end
+            end, options.RefreshDebounce or 0.5)
+        end)
+        if ok then
+            controller.Watcher = watcher
+        else
+            table.insert(controller.Diagnostics, "Auto-refresh watcher gagal: " .. tostring(watcher))
         end
+    end
 
+    function controller.Destroy()
+        if controller.Destroyed then return end
         controller.Destroyed = true
+        if controller.Watcher and controller.Watcher.Disconnect then
+            pcall(function() controller.Watcher.Disconnect() end)
+        end
         window.Destroy()
     end
 
     controller.Refresh()
-
     return controller
 end
 
