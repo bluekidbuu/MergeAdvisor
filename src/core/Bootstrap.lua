@@ -125,6 +125,7 @@ function Bootstrap.Start(options)
     local MainWindow = assert(modules.MainWindow, "MainWindow belum dimasukkan")
     local ManualMergeTab = assert(modules.ManualMergeTab, "ManualMergeTab belum dimasukkan")
     local MergePreparation = assert(modules.MergePreparation, "MergePreparation belum dimasukkan")
+    local MachineSlotReader = assert(modules.MachineSlotReader, "MachineSlotReader belum dimasukkan")
 
     local Players = game:GetService("Players")
     local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -157,6 +158,13 @@ function Bootstrap.Start(options)
                     if ok and value then return value end
                 end
                 return name
+            end)
+        end,
+        ReadMachine = function()
+            return MachineSlotReader.Read(player, controller.Animals, function(name,kg,variant,mutation,size,enchant)
+                return IncomeCalculator.CalculateFromGame(
+                    controller.Configs,name,size,mutation,kg,variant,enchant
+                )
             end)
         end,
     })

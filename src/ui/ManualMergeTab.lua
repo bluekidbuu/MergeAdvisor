@@ -87,9 +87,10 @@ function ManualMergeTab.Create(parent,opts)
         pick.Activated:Connect(function() openPicker(i) end)
     end
     close.Activated:Connect(function() picker.Visible=false end)
-    local analyze=button(panel,"ANALISIS",Color3.fromRGB(36,148,103),UDim2.new(0.31,-5,0,27));analyze.Position=UDim2.new(0,7,1,-96)
-    local clear=button(panel,"KOSONGKAN",Color3.fromRGB(100,76,88),UDim2.new(0.29,-5,0,27));clear.Position=UDim2.new(0.33,0,1,-96)
-    local prepare=button(panel,"SIAPKAN SLOT",Color3.fromRGB(42,111,153),UDim2.new(0.35,-5,0,27));prepare.Position=UDim2.new(0.64,0,1,-96)
+    local analyze=button(panel,"ANALISIS",Color3.fromRGB(36,148,103),UDim2.new(0.23,-4,0,27));analyze.Position=UDim2.new(0,6,1,-96)
+    local clear=button(panel,"KOSONGKAN",Color3.fromRGB(100,76,88),UDim2.new(0.22,-4,0,27));clear.Position=UDim2.new(0.245,0,1,-96)
+    local sync=button(panel,"AMBIL MESIN",Color3.fromRGB(121,91,48),UDim2.new(0.25,-4,0,27));sync.Position=UDim2.new(0.475,0,1,-96)
+    local prepare=button(panel,"SIAPKAN SLOT",Color3.fromRGB(42,111,153),UDim2.new(0.25,-5,0,27));prepare.Position=UDim2.new(0.735,0,1,-96)
     local output=make("TextLabel",{Position=UDim2.new(0,7,1,-65),Size=UDim2.new(1,-14,0,57),BackgroundColor3=Color3.fromRGB(34,47,66),
         BorderSizePixel=0,Font=Enum.Font.Code,Text="Hasil analisis akan muncul di sini.",TextColor3=Color3.fromRGB(225,235,248),
         TextSize=9,TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top},panel);round(output)
@@ -122,6 +123,26 @@ function ManualMergeTab.Create(parent,opts)
         output.Text=table.concat(lines,"\n");output.TextColor3=Color3.fromRGB(126,214,176)
     end)
     clear.Activated:Connect(function() for i=1,3 do setSlot(i,nil) end;output.Text="Slot dikosongkan." end)
+    sync.Activated:Connect(function()
+        if type(opts.ReadMachine) ~= "function" then
+            output.Text = "Pembaca slot mesin belum tersedia."
+            return
+        end
+        sync.Active=false;sync.Text="MEMBACA..."
+        local ok,pets,err=pcall(opts.ReadMachine)
+        if not ok then
+            output.Text="MACHINE READ ERROR: "..tostring(pets)
+            output.TextColor3=Color3.fromRGB(255,170,150)
+        elseif not pets then
+            output.Text=tostring(err or "Data mesin tidak dapat dibaca.")
+            output.TextColor3=Color3.fromRGB(255,170,150)
+        else
+            for i=1,3 do setSlot(i,pets[i]) end
+            output.Text="3/3 slot berhasil disalin dari Merge Machine. Tekan ANALISIS untuk menghitung peluang."
+            output.TextColor3=Color3.fromRGB(126,214,176)
+        end
+        sync.Active=true;sync.Text="AMBIL MESIN"
+    end)
     prepare.Activated:Connect(function()
         local pets,err=readSlots();if not pets then output.Text=err;return end
         for i,p in ipairs(pets) do if not p.tool then output.Text="Slot "..i.." adalah data custom. Persiapan mesin hanya untuk hewan inventory.";return end end
@@ -134,6 +155,11 @@ function ManualMergeTab.Create(parent,opts)
     end)
     local api={}
     function api.SetAnimals(v) animals=v or {} end
+    function api.SetSlots(v)
+        if type(v) ~= "table" or #v ~= 3 then return false end
+        for i=1,3 do setSlot(i,v[i]) end
+        return true
+    end
     function api.Destroy() panel:Destroy() end
     return api
 end
