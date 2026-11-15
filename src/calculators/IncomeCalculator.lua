@@ -247,4 +247,46 @@ function IncomeCalculator.Calculate(animal, dependencies)
     return income, breakdown
 end
 
+
+-- Menggunakan kalkulator income ASLI dari game.
+-- Parameter mengikuti EggRewards.PlacedCashPerSecond.
+
+function IncomeCalculator.CalculateFromGame(
+    configs,
+    animalName,
+    sizeMult,
+    mutation,
+    weightKg,
+    variant,
+    enchant
+)
+    assert(configs and configs.EggRewards,
+        "EggRewards belum dimuat")
+
+    local eggRewards = configs.EggRewards
+    assert(type(eggRewards.PlacedCashPerSecond) == "function",
+        "PlacedCashPerSecond tidak tersedia")
+
+    local enchantConfig = configs.EnchantConfig
+
+    if enchantConfig and type(enchantConfig.CashMult) == "function" then
+        return eggRewards.PlacedCashPerSecond(
+            animalName,
+            sizeMult,
+            mutation,
+            weightKg,
+            variant,
+            enchant
+        )
+    end
+
+    return eggRewards.PlacedCashPerSecond(
+        animalName,
+        sizeMult,
+        mutation,
+        weightKg,
+        variant
+    )
+end
+
 return IncomeCalculator
