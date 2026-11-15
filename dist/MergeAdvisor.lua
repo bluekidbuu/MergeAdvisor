@@ -630,6 +630,340 @@ end
 return IncomeCalculator
 end)()
 
+-- MODULE: src/calculators/MergeCalculator.lua
+local MergeCalculator = (function()
+-- MergeCalculator.lua
+-- Mesin rekomendasi berbasis MergeConfig dan EggRewards asli.
+-- Read-only: tidak menjalankan merge dan tidak mengubah Tool pemain.
+
+local MergeCalculator = {}
+
+local DEFAULTS = {
+    SlotCount = 3,
+    MaxPerSpecies = 60,
+    MinGain = 0,
+    SortBy = "gain", -- "gain" atau "ratio"
+}
+
+local function getName(pet)
+    return pet and (pet.AnimalName or pet.Name or pet.name) or nil
+end
+
+local function getWeight(pet)
+    return tonumber(pet and (pet.WeightKg or pet.kg)) or 0
+end
+
+local function getIncome(pet)
+    return tonumber(pet and (
+        pet.Income or pet.CashPerSecond
+        or pet.PlacedCashPerSecond or pet.income
+    )) or 0
+end
+
+local function getVariant(pet)
+    local value = pet and (pet.Variant or pet.var)
+    if type(value) == "string" and value ~= "" then return value end
+    return nil
+end
+
+local function getMutation(pet)
+    local value = pet and (pet.Mutation or pet.mut)
+    if type(value) == "string" and value ~= "" then return value end
+    return nil
+end
+
+local function makeVariantOptions(odds, remain)
+    local options = {}
+    if type(odds) == "table" then
+        for tier, chance in pairs(odds) do
+            if type(chance) == "number" and chance > 0 then
+                table.insert(options, {Name = tier, Chance = chance})
+            end
+        end
+    end
+    if type(remain) == "number" and remain > 0 then
+        table.insert(options, {Name = false, Chance = remain})
+    end
+    table.sort(options, function(a, b)
+        return tostring(a.Name or "Normal") < tostring(b.Name or "Normal")
+    end)
+    return options
+end
+
+local function makeMutationOptions(odds, remain)
+    local options = {}
+    if type(odds) == "table" then
+        for _, entry in ipairs(odds) do
+            if type(entry) == "table"
+                and type(entry.Chance) == "number"
+                and entry.Chance > 0 then
+                table.insert(options, {
+                    Name = entry.Name,
+                    Chance = entry.Chance,
+                })
+            end
+        end
+    end
+    if type(remain) == "number" and remain > 0 then
+        table.insert(options, {Name = false, Chance = remain})
+    end
+    table.sort(options, function(a, b)
+        return tostring(a.Name or "None") < tostring(b.Name or "None")
+    end)
+    return options
+end
+
+local function calculateIncome(configs, name, totalWeight, mutation, variant)
+    local eggRewards = configs.EggRewards
+    local enchantConfig = configs.EnchantConfig
+
+    if enchantConfig and type(enchantConfig.CashMult) == "function" then
+        return eggRewards.PlacedCashPerSecond(
+            name, nil, mutation, totalWeight, variant, nil
+        )
+    end
+
+    return eggRewards.PlacedCashPerSecond(
+        name, nil, mutation, totalWeight, variant
+    )
+end
+
+function MergeCalculator.Evaluate(a, b, c, configs)
+    if not a or not b or not c then
+        return nil, "Tiga hewan wajib tersedia"
+    end
+
+    local name = getName(a)
+    if type(name) ~= "string" or name == ""
+        or getName(b) ~= name or getName(c) ~= name then
+        return nil, "Spesies ketiga hewan harus sama"
+    end
+
+    local wa, wb, wc = getWeight(a), getWeight(b), getWeight(c)
+    if wa <= 0 or wb <= 0 or wc <= 0 then
+        return nil, "Berat input tidak valid"
+    end
+
+    local mergeConfig = configs and configs.MergeConfig
+    local eggRewards = configs and configs.EggRewards
+    if type(mergeConfig) ~= "table"
+        or type(mergeConfig.VariantOdds) ~= "function"
+        or type(mergeConfig.MutationOdds) ~= "function"
+        or type(eggRewards) ~= "table"
+        or type(eggRewards.PlacedCashPerSecond) ~= "function" then
+        return nil, "API MergeConfig/EggRewards tidak tersedia"
+    end
+
+    local totalWeight = wa + wb + wc
+    local variants = {getVariant(a), getVariant(b), getVariant(c)}
+    local mutations = {getMutation(a), getMutation(b), getMutation(c)}
+
+    local okVariant, variantOdds, variantRemain = pcall(
+        mergeConfig.VariantOdds, variants, 3
+    )
+    if not okVariant then
+        return nil, "VariantOdds gagal: " .. tostring(variantOdds)
+    end
+
+    local okMutation, mutationOdds, mutationRemain = pcall(
+        mergeConfig.MutationOdds, mutations, 3
+    )
+    if not okMutation then
+        return nil, "MutationOdds gagal: " .. tostring(mutationOdds)
+    end
+
+    local vOptions = makeVariantOptions(variantOdds, variantRemain)
+    local mOptions = makeMutationOptions(mutationOdds, mutationRemain)
+    if #vOptions == 0 or #mOptions == 0 then
+        return nil, "Odds variant/mutation kosong"
+    end
+
+    local expected = 0
+    local best = -math.huge
+    local worst = math.huge
+    local outcomes = {}
+    local probabilityTotal = 0
+    local failedProbability = 0
+
+    for _, variant in ipairs(vOptions) do
+        for _, mutation in ipairs(mOptions) do
+            local chance = variant.Chance * mutation.Chance
+            if chance > 0 then
+                local ok, income = pcall(
+                    calculateIncome,
+                    configs,
+                    name,
+                    totalWeight,
+                    mutation.Name or nil,
+                    variant.Name or nil
+                )
+
+                if ok and type(income) == "number"
+                    and income == income and income >= 0 then
+                    expected = expected + chance * income
+                    best = math.max(best, income)
+                    worst = math.min(worst, income)
+                    probabilityTotal = probabilityTotal + chance
+                    table.insert(outcomes, {
+                        Variant = variant.Name or "Normal",
+                        Mutation = mutation.Name or "None",
+                        Chance = chance,
+                        Income = income,
+                    })
+                else
+                    failedProbability = failedProbability + chance
+                end
+            end
+        end
+    end
+
+    -- Jangan mengeluarkan rekomendasi jika distribusi odds tidak lengkap.
+    if #outcomes == 0 then
+        return nil, "Tidak ada outcome yang berhasil dihitung"
+    end
+    if failedProbability > 0.000001 then
+        return nil, "Sebagian outcome gagal dihitung"
+    end
+    if math.abs(probabilityTotal - 1) > 0.005 then
+        return nil, string.format(
+            "Total probabilitas tidak valid: %.4f%%",
+            probabilityTotal * 100
+        )
+    end
+
+    table.sort(outcomes, function(x, y)
+        if x.Chance == y.Chance then return x.Income > y.Income end
+        return x.Chance > y.Chance
+    end)
+
+    local inputIncome = getIncome(a) + getIncome(b) + getIncome(c)
+    local growth = 0
+    if type(mergeConfig.GrowthSeconds) == "function" then
+        local rarity
+        if type(eggRewards.RarityOf) == "function" then
+            local ok, value = pcall(eggRewards.RarityOf, name)
+            if ok then rarity = value end
+        end
+        local ok, value = pcall(mergeConfig.GrowthSeconds, totalWeight, rarity)
+        if ok and type(value) == "number" then growth = value end
+    end
+
+    return {
+        Pets = {a, b, c},
+        Name = name,
+        WeightKg = totalWeight,
+        Expected = expected,
+        Best = best,
+        Worst = worst,
+        Input = inputIncome,
+        Gain = expected - inputIncome,
+        Ratio = inputIncome > 0 and expected / inputIncome or 0,
+        VariantOdds = vOptions,
+        MutationOdds = mOptions,
+        Outcomes = outcomes,
+        ProbabilityTotal = probabilityTotal,
+        FailedProbability = failedProbability,
+        GrowthSeconds = growth,
+    }
+end
+
+function MergeCalculator.Advise(pets, configs, options)
+    options = options or {}
+    local slotCount = tonumber(options.SlotCount)
+        or tonumber(configs and configs.SlotCount)
+        or DEFAULTS.SlotCount
+    local maxPerSpecies = tonumber(options.MaxPerSpecies)
+        or DEFAULTS.MaxPerSpecies
+    local minGain = tonumber(options.MinGain)
+    if minGain == nil then minGain = DEFAULTS.MinGain end
+    local sortBy = options.SortBy == "ratio" and "Ratio" or "Gain"
+
+    if slotCount ~= 3 then
+        return {}, {"Merge Advisor v10.2.0 memakai tepat 3 slot; SlotCount aktif bukan 3."}
+    end
+
+    local groups = {}
+    for _, pet in ipairs(pets or {}) do
+        local name = getName(pet)
+        if type(name) == "string" and name ~= "" then
+            groups[name] = groups[name] or {}
+            table.insert(groups[name], pet)
+        end
+    end
+
+    local results, diagnostics, diagnosticMap = {}, {}, {}
+    for species, list in pairs(groups) do
+        if #list >= slotCount then
+            table.sort(list, function(x, y)
+                local xWeight, yWeight = getWeight(x), getWeight(y)
+                if xWeight == yWeight then return getIncome(x) > getIncome(y) end
+                return xWeight > yWeight
+            end)
+
+            while #list > maxPerSpecies do table.remove(list) end
+            local evaluations = {}
+
+            for i = 1, #list - 2 do
+                for j = i + 1, #list - 1 do
+                    for k = j + 1, #list do
+                        local result, err = MergeCalculator.Evaluate(
+                            list[i], list[j], list[k], configs
+                        )
+                        if result then
+                            result.Indices = {i, j, k}
+                            table.insert(evaluations, result)
+                        elseif err then
+                            -- Simpan satu diagnostik per spesies, bukan spam per triplet.
+                            if not diagnosticMap[species] then
+                                diagnosticMap[species] = err
+                            end
+                        end
+                    end
+                end
+            end
+
+            table.sort(evaluations, function(x, y)
+                if x[sortBy] == y[sortBy] then
+                    return x.Gain > y.Gain
+                end
+                return x[sortBy] > y[sortBy]
+            end)
+
+            -- Pilih kandidat non-overlap seperti implementasi legacy.
+            local used = {}
+            for _, result in ipairs(evaluations) do
+                local idx = result.Indices
+                if result.Gain >= minGain
+                    and not used[idx[1]]
+                    and not used[idx[2]]
+                    and not used[idx[3]] then
+                    used[idx[1]], used[idx[2]], used[idx[3]] = true, true, true
+                    table.insert(results, result)
+                end
+            end
+        end
+    end
+
+    local diagnosticSpecies = {}
+    for species in pairs(diagnosticMap) do
+        table.insert(diagnosticSpecies, species)
+    end
+    table.sort(diagnosticSpecies)
+    for _, species in ipairs(diagnosticSpecies) do
+        table.insert(diagnostics, "[" .. species .. "] " .. tostring(diagnosticMap[species]))
+    end
+
+    table.sort(results, function(x, y)
+        if x[sortBy] == y[sortBy] then return x.Gain > y.Gain end
+        return x[sortBy] > y[sortBy]
+    end)
+
+    return results, diagnostics
+end
+
+return MergeCalculator
+end)()
+
 -- MODULE: src/ui/MainWindow.lua
 local MainWindow = (function()
 -- MainWindow.lua
@@ -783,7 +1117,7 @@ end)()
 -- MODULE: src/core/Bootstrap.lua
 local Bootstrap = (function()
 -- Bootstrap.lua
--- Penghubung konfigurasi, inventory, live refresh, dan GUI.
+-- Menghubungkan config, inventory, merge engine, live refresh, dan GUI diagnostik.
 
 local Bootstrap = {}
 
@@ -802,11 +1136,28 @@ local function getAnimalName(animal)
 end
 
 local function formatIncome(value)
-    if value >= 1e12 then return string.format("%.2fT/s", value / 1e12)
-    elseif value >= 1e9 then return string.format("%.2fB/s", value / 1e9)
-    elseif value >= 1e6 then return string.format("%.2fM/s", value / 1e6)
-    elseif value >= 1e3 then return string.format("%.2fK/s", value / 1e3) end
+    value = tonumber(value) or 0
+    if math.abs(value) >= 1e12 then return string.format("%.2fT/s", value / 1e12)
+    elseif math.abs(value) >= 1e9 then return string.format("%.2fB/s", value / 1e9)
+    elseif math.abs(value) >= 1e6 then return string.format("%.2fM/s", value / 1e6)
+    elseif math.abs(value) >= 1e3 then return string.format("%.2fK/s", value / 1e3) end
     return string.format("%.2f/s", value)
+end
+
+local function formatDuration(seconds, configs)
+    local mergeConfig = configs and configs.MergeConfig
+    if mergeConfig and type(mergeConfig.FormatDuration) == "function" then
+        local ok, value = pcall(mergeConfig.FormatDuration, seconds)
+        if ok and value ~= nil then return tostring(value) end
+    end
+    seconds = math.max(0, tonumber(seconds) or 0)
+    if seconds >= 3600 then
+        return string.format("%dh %dm", math.floor(seconds / 3600),
+            math.floor((seconds % 3600) / 60))
+    elseif seconds >= 60 then
+        return string.format("%dm %ds", math.floor(seconds / 60), math.floor(seconds % 60))
+    end
+    return string.format("%ds", math.floor(seconds))
 end
 
 local function sortedErrorMessages(errors, prefix)
@@ -826,12 +1177,69 @@ local function sortedErrorMessages(errors, prefix)
     return result
 end
 
+local function petDescription(pet)
+    local parts = {
+        getAnimalName(pet),
+        string.format("%.1f kg", tonumber(pet.WeightKg or pet.kg) or 0),
+        formatIncome(getIncome(pet)),
+    }
+    local variant = pet.Variant or pet.var
+    local mutation = pet.Mutation or pet.mut
+    if variant then table.insert(parts, "Var " .. tostring(variant)) end
+    if mutation then table.insert(parts, "Mut " .. tostring(mutation)) end
+    return table.concat(parts, " | ")
+end
+
+local function describeMerge(result, rank, configs)
+    local lines = {}
+    local sign = result.Gain >= 0 and "+" or "-"
+    table.insert(lines, string.format("#%d %s | %s%s | x%.3f",
+        rank, result.Name, sign, formatIncome(math.abs(result.Gain)), result.Ratio))
+    for _, pet in ipairs(result.Pets) do
+        table.insert(lines, "  - " .. petDescription(pet))
+    end
+    table.insert(lines, string.format(
+        "  Total %.2f kg | Expected %s | Input %s",
+        result.WeightKg, formatIncome(result.Expected), formatIncome(result.Input)
+    ))
+    table.insert(lines, string.format(
+        "  Best %s | Worst %s | Growth %s",
+        formatIncome(result.Best), formatIncome(result.Worst),
+        formatDuration(result.GrowthSeconds, configs)
+    ))
+    table.insert(lines, string.format(
+        "  Joint outcomes: %d | Probabilitas termodel: %.2f%%",
+        #result.Outcomes, result.ProbabilityTotal * 100
+    ))
+
+    table.insert(lines, "  HASIL VARIANT:")
+    for _, option in ipairs(result.VariantOdds) do
+        table.insert(lines, string.format("    %s: %.2f%%",
+            tostring(option.Name or "Normal"), option.Chance * 100))
+    end
+    table.insert(lines, "  HASIL MUTATION:")
+    for _, option in ipairs(result.MutationOdds) do
+        table.insert(lines, string.format("    %s: %.2f%%",
+            tostring(option.Name or "None"), option.Chance * 100))
+    end
+
+    table.insert(lines, "  OUTCOME TERATAS:")
+    for index = 1, math.min(6, #result.Outcomes) do
+        local outcome = result.Outcomes[index]
+        table.insert(lines, string.format("    %s / %s | %.2f%% | %s",
+            tostring(outcome.Variant), tostring(outcome.Mutation),
+            outcome.Chance * 100, formatIncome(outcome.Income)))
+    end
+    return table.concat(lines, "\n")
+end
+
 function Bootstrap.Start(options)
     options = options or {}
     local modules = options.Modules or {}
     local ConfigLoader = assert(modules.GameConfigLoader, "GameConfigLoader belum dimasukkan")
     local InventoryReader = assert(modules.InventoryReader, "InventoryReader belum dimasukkan")
     local IncomeCalculator = assert(modules.IncomeCalculator, "IncomeCalculator belum dimasukkan")
+    local MergeCalculator = assert(modules.MergeCalculator, "MergeCalculator belum dimasukkan")
     local MainWindow = assert(modules.MainWindow, "MainWindow belum dimasukkan")
 
     local Players = game:GetService("Players")
@@ -846,12 +1254,12 @@ function Bootstrap.Start(options)
 
     local window = MainWindow.Create(playerGui)
     local controller = {
-        Configs = nil, Animals = {}, Diagnostics = {},
+        Configs = nil, Animals = {}, MergeResults = {}, Diagnostics = {},
         TotalIncome = 0, LastReport = "", Destroyed = false,
         Watcher = nil, Refreshing = false, RefreshQueued = false,
     }
 
-    local function makeReport(animals, diagnostics, totalIncome, scannedTools)
+    local function makeReport(animals, diagnostics, totalIncome, scannedTools, mergeResults, mergeDiagnostics, configs)
         local lines = {
             "MERGE ADVISOR",
             "==============================",
@@ -880,6 +1288,28 @@ function Bootstrap.Start(options)
             local suffix = #details > 0 and (" | " .. table.concat(details, " | ")) or ""
             table.insert(lines, string.format("%02d. %s | %s%s",
                 index, name, formatIncome(income), suffix))
+        end
+
+        table.insert(lines, "")
+        table.insert(lines, "MERGE RECOMMENDATIONS")
+        table.insert(lines, "------------------------------")
+        table.insert(lines, "Kandidat terpilih: " .. #mergeResults
+            .. " | syarat: 3 spesies sama | Expected Gain >= 0")
+        table.insert(lines, "Catatan: estimasi output merge memakai Enchant=nil sesuai v10.2.0; income input memakai data aktual.")
+        if #mergeResults == 0 then
+            table.insert(lines, "Tidak ditemukan kombinasi merge menguntungkan yang memenuhi odds lengkap.")
+        else
+            for index = 1, math.min(options.TopMergeResults or 8, #mergeResults) do
+                table.insert(lines, describeMerge(mergeResults[index], index, configs))
+                table.insert(lines, "")
+            end
+        end
+
+        if #mergeDiagnostics > 0 then
+            table.insert(lines, "DIAGNOSTIK MERGE")
+            for _, message in ipairs(mergeDiagnostics) do
+                table.insert(lines, "- " .. safeString(message))
+            end
         end
 
         table.insert(lines, "")
@@ -951,13 +1381,35 @@ function Bootstrap.Start(options)
         local totalIncome = 0
         for _, animal in ipairs(animals) do totalIncome = totalIncome + getIncome(animal) end
 
+        window.SetStatus("Menghitung peluang merge...", false)
+        local mergeOK, mergeResults, mergeDiagnostics = pcall(function()
+            return MergeCalculator.Advise(animals, configs, {
+                SlotCount = configs.SlotCount or 3,
+                MaxPerSpecies = options.MaxPerSpecies or 60,
+                MinGain = options.MinGain or 0,
+                SortBy = options.SortBy or "gain",
+            })
+        end)
+        if not mergeOK then
+            local mergeError = mergeResults
+            mergeResults = {}
+            mergeDiagnostics = {"MergeCalculator gagal: " .. tostring(mergeError)}
+        end
+        if type(mergeResults) ~= "table" then mergeResults = {} end
+        if type(mergeDiagnostics) ~= "table" then mergeDiagnostics = {} end
+
         controller.Animals = animals
+        controller.MergeResults = mergeResults
         controller.Diagnostics = diagnostics
         controller.TotalIncome = totalIncome
-        local report = makeReport(animals, diagnostics, totalIncome, scannedTools)
+        local report = makeReport(
+            animals, diagnostics, totalIncome, scannedTools,
+            mergeResults, mergeDiagnostics, configs
+        )
         controller.LastReport = report
         window.SetText(report)
-        window.SetStatus("Selesai - " .. #animals .. " hewan | " .. formatIncome(totalIncome), true)
+        window.SetStatus("Selesai - " .. #animals .. " hewan | "
+            .. #mergeResults .. " rekomendasi", true)
         controller.Refreshing = false
 
         if controller.RefreshQueued then
@@ -1015,6 +1467,7 @@ local controller = Bootstrap.Start({
         GameConfigLoader = GameConfigLoader,
         InventoryReader = InventoryReader,
         IncomeCalculator = IncomeCalculator,
+        MergeCalculator = MergeCalculator,
         MainWindow = MainWindow,
     }
 })

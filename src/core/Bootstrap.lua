@@ -1,5 +1,5 @@
 -- Bootstrap.lua
--- Penghubung konfigurasi, inventory, live refresh, dan GUI.
+-- Menghubungkan config, inventory, merge engine, live refresh, dan GUI diagnostik.
 
 local Bootstrap = {}
 
@@ -18,11 +18,28 @@ local function getAnimalName(animal)
 end
 
 local function formatIncome(value)
-    if value >= 1e12 then return string.format("%.2fT/s", value / 1e12)
-    elseif value >= 1e9 then return string.format("%.2fB/s", value / 1e9)
-    elseif value >= 1e6 then return string.format("%.2fM/s", value / 1e6)
-    elseif value >= 1e3 then return string.format("%.2fK/s", value / 1e3) end
+    value = tonumber(value) or 0
+    if math.abs(value) >= 1e12 then return string.format("%.2fT/s", value / 1e12)
+    elseif math.abs(value) >= 1e9 then return string.format("%.2fB/s", value / 1e9)
+    elseif math.abs(value) >= 1e6 then return string.format("%.2fM/s", value / 1e6)
+    elseif math.abs(value) >= 1e3 then return string.format("%.2fK/s", value / 1e3) end
     return string.format("%.2f/s", value)
+end
+
+local function formatDuration(seconds, configs)
+    local mergeConfig = configs and configs.MergeConfig
+    if mergeConfig and type(mergeConfig.FormatDuration) == "function" then
+        local ok, value = pcall(mergeConfig.FormatDuration, seconds)
+        if ok and value ~= nil then return tostring(value) end
+    end
+    seconds = math.max(0, tonumber(seconds) or 0)
+    if seconds >= 3600 then
+        return string.format("%dh %dm", math.floor(seconds / 3600),
+            math.floor((seconds % 3600) / 60))
+    elseif seconds >= 60 then
+        return string.format("%dm %ds", math.floor(seconds / 60), math.floor(seconds % 60))
+    end
+    return string.format("%ds", math.floor(seconds))
 end
 
 local function sortedErrorMessages(errors, prefix)
@@ -42,12 +59,69 @@ local function sortedErrorMessages(errors, prefix)
     return result
 end
 
+local function petDescription(pet)
+    local parts = {
+        getAnimalName(pet),
+        string.format("%.1f kg", tonumber(pet.WeightKg or pet.kg) or 0),
+        formatIncome(getIncome(pet)),
+    }
+    local variant = pet.Variant or pet.var
+    local mutation = pet.Mutation or pet.mut
+    if variant then table.insert(parts, "Var " .. tostring(variant)) end
+    if mutation then table.insert(parts, "Mut " .. tostring(mutation)) end
+    return table.concat(parts, " | ")
+end
+
+local function describeMerge(result, rank, configs)
+    local lines = {}
+    local sign = result.Gain >= 0 and "+" or "-"
+    table.insert(lines, string.format("#%d %s | %s%s | x%.3f",
+        rank, result.Name, sign, formatIncome(math.abs(result.Gain)), result.Ratio))
+    for _, pet in ipairs(result.Pets) do
+        table.insert(lines, "  - " .. petDescription(pet))
+    end
+    table.insert(lines, string.format(
+        "  Total %.2f kg | Expected %s | Input %s",
+        result.WeightKg, formatIncome(result.Expected), formatIncome(result.Input)
+    ))
+    table.insert(lines, string.format(
+        "  Best %s | Worst %s | Growth %s",
+        formatIncome(result.Best), formatIncome(result.Worst),
+        formatDuration(result.GrowthSeconds, configs)
+    ))
+    table.insert(lines, string.format(
+        "  Joint outcomes: %d | Probabilitas termodel: %.2f%%",
+        #result.Outcomes, result.ProbabilityTotal * 100
+    ))
+
+    table.insert(lines, "  HASIL VARIANT:")
+    for _, option in ipairs(result.VariantOdds) do
+        table.insert(lines, string.format("    %s: %.2f%%",
+            tostring(option.Name or "Normal"), option.Chance * 100))
+    end
+    table.insert(lines, "  HASIL MUTATION:")
+    for _, option in ipairs(result.MutationOdds) do
+        table.insert(lines, string.format("    %s: %.2f%%",
+            tostring(option.Name or "None"), option.Chance * 100))
+    end
+
+    table.insert(lines, "  OUTCOME TERATAS:")
+    for index = 1, math.min(6, #result.Outcomes) do
+        local outcome = result.Outcomes[index]
+        table.insert(lines, string.format("    %s / %s | %.2f%% | %s",
+            tostring(outcome.Variant), tostring(outcome.Mutation),
+            outcome.Chance * 100, formatIncome(outcome.Income)))
+    end
+    return table.concat(lines, "\n")
+end
+
 function Bootstrap.Start(options)
     options = options or {}
     local modules = options.Modules or {}
     local ConfigLoader = assert(modules.GameConfigLoader, "GameConfigLoader belum dimasukkan")
     local InventoryReader = assert(modules.InventoryReader, "InventoryReader belum dimasukkan")
     local IncomeCalculator = assert(modules.IncomeCalculator, "IncomeCalculator belum dimasukkan")
+    local MergeCalculator = assert(modules.MergeCalculator, "MergeCalculator belum dimasukkan")
     local MainWindow = assert(modules.MainWindow, "MainWindow belum dimasukkan")
 
     local Players = game:GetService("Players")
@@ -62,12 +136,12 @@ function Bootstrap.Start(options)
 
     local window = MainWindow.Create(playerGui)
     local controller = {
-        Configs = nil, Animals = {}, Diagnostics = {},
+        Configs = nil, Animals = {}, MergeResults = {}, Diagnostics = {},
         TotalIncome = 0, LastReport = "", Destroyed = false,
         Watcher = nil, Refreshing = false, RefreshQueued = false,
     }
 
-    local function makeReport(animals, diagnostics, totalIncome, scannedTools)
+    local function makeReport(animals, diagnostics, totalIncome, scannedTools, mergeResults, mergeDiagnostics, configs)
         local lines = {
             "MERGE ADVISOR",
             "==============================",
@@ -96,6 +170,28 @@ function Bootstrap.Start(options)
             local suffix = #details > 0 and (" | " .. table.concat(details, " | ")) or ""
             table.insert(lines, string.format("%02d. %s | %s%s",
                 index, name, formatIncome(income), suffix))
+        end
+
+        table.insert(lines, "")
+        table.insert(lines, "MERGE RECOMMENDATIONS")
+        table.insert(lines, "------------------------------")
+        table.insert(lines, "Kandidat terpilih: " .. #mergeResults
+            .. " | syarat: 3 spesies sama | Expected Gain >= 0")
+        table.insert(lines, "Catatan: estimasi output merge memakai Enchant=nil sesuai v10.2.0; income input memakai data aktual.")
+        if #mergeResults == 0 then
+            table.insert(lines, "Tidak ditemukan kombinasi merge menguntungkan yang memenuhi odds lengkap.")
+        else
+            for index = 1, math.min(options.TopMergeResults or 8, #mergeResults) do
+                table.insert(lines, describeMerge(mergeResults[index], index, configs))
+                table.insert(lines, "")
+            end
+        end
+
+        if #mergeDiagnostics > 0 then
+            table.insert(lines, "DIAGNOSTIK MERGE")
+            for _, message in ipairs(mergeDiagnostics) do
+                table.insert(lines, "- " .. safeString(message))
+            end
         end
 
         table.insert(lines, "")
@@ -167,13 +263,35 @@ function Bootstrap.Start(options)
         local totalIncome = 0
         for _, animal in ipairs(animals) do totalIncome = totalIncome + getIncome(animal) end
 
+        window.SetStatus("Menghitung peluang merge...", false)
+        local mergeOK, mergeResults, mergeDiagnostics = pcall(function()
+            return MergeCalculator.Advise(animals, configs, {
+                SlotCount = configs.SlotCount or 3,
+                MaxPerSpecies = options.MaxPerSpecies or 60,
+                MinGain = options.MinGain or 0,
+                SortBy = options.SortBy or "gain",
+            })
+        end)
+        if not mergeOK then
+            local mergeError = mergeResults
+            mergeResults = {}
+            mergeDiagnostics = {"MergeCalculator gagal: " .. tostring(mergeError)}
+        end
+        if type(mergeResults) ~= "table" then mergeResults = {} end
+        if type(mergeDiagnostics) ~= "table" then mergeDiagnostics = {} end
+
         controller.Animals = animals
+        controller.MergeResults = mergeResults
         controller.Diagnostics = diagnostics
         controller.TotalIncome = totalIncome
-        local report = makeReport(animals, diagnostics, totalIncome, scannedTools)
+        local report = makeReport(
+            animals, diagnostics, totalIncome, scannedTools,
+            mergeResults, mergeDiagnostics, configs
+        )
         controller.LastReport = report
         window.SetText(report)
-        window.SetStatus("Selesai - " .. #animals .. " hewan | " .. formatIncome(totalIncome), true)
+        window.SetStatus("Selesai - " .. #animals .. " hewan | "
+            .. #mergeResults .. " rekomendasi", true)
         controller.Refreshing = false
 
         if controller.RefreshQueued then
