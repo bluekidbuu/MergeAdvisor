@@ -50,10 +50,44 @@ function MainWindow.Create(playerGui)
     status.TextTruncate = Enum.TextTruncate.AtEnd
     status.Parent = frame
 
+    local inventoryTab = Instance.new("TextButton")
+    inventoryTab.Name = "InventoryTab"
+    inventoryTab.Position = UDim2.fromOffset(10,72)
+    inventoryTab.Size = UDim2.new(0.5,-6,0,28)
+    inventoryTab.BackgroundColor3 = Color3.fromRGB(38,133,112)
+    inventoryTab.BorderSizePixel = 0
+    inventoryTab.Text = "INVENTORY / REKOMENDASI"
+    inventoryTab.TextColor3 = Color3.new(1,1,1)
+    inventoryTab.Font = Enum.Font.GothamBold
+    inventoryTab.TextSize = 10
+    inventoryTab.Parent = frame
+    Instance.new("UICorner",inventoryTab).CornerRadius = UDim.new(0,6)
+
+    local manualTab = Instance.new("TextButton")
+    manualTab.Name = "ManualTab"
+    manualTab.Position = UDim2.new(0.5,2,0,72)
+    manualTab.Size = UDim2.new(0.5,-12,0,28)
+    manualTab.BackgroundColor3 = Color3.fromRGB(54,75,103)
+    manualTab.BorderSizePixel = 0
+    manualTab.Text = "MANUAL MERGE"
+    manualTab.TextColor3 = Color3.new(1,1,1)
+    manualTab.Font = Enum.Font.GothamBold
+    manualTab.TextSize = 10
+    manualTab.Parent = frame
+    Instance.new("UICorner",manualTab).CornerRadius = UDim.new(0,6)
+
+    local manualRoot = Instance.new("Frame")
+    manualRoot.Name = "ManualRoot"
+    manualRoot.Position = UDim2.fromOffset(10,108)
+    manualRoot.Size = UDim2.new(1,-20,1,-161)
+    manualRoot.BackgroundTransparency = 1
+    manualRoot.Visible = false
+    manualRoot.Parent = frame
+
     local scroll = Instance.new("ScrollingFrame")
     scroll.Name = "ReportScroll"
-    scroll.Position = UDim2.fromOffset(10, 72)
-    scroll.Size = UDim2.new(1, -20, 1, -125)
+    scroll.Position = UDim2.fromOffset(10,108)
+    scroll.Size = UDim2.new(1,-20,1,-161)
     scroll.BackgroundColor3 = Color3.fromRGB(15, 18, 25)
     scroll.BorderSizePixel = 0
     scroll.ScrollBarThickness = 5
@@ -123,6 +157,21 @@ function MainWindow.Create(playerGui)
     end))
 
     local api = {}
+    local function showInventory()
+        scroll.Visible = true
+        manualRoot.Visible = false
+        inventoryTab.BackgroundColor3 = Color3.fromRGB(38,133,112)
+        manualTab.BackgroundColor3 = Color3.fromRGB(54,75,103)
+    end
+    local function showManual()
+        scroll.Visible = false
+        manualRoot.Visible = true
+        inventoryTab.BackgroundColor3 = Color3.fromRGB(54,75,103)
+        manualTab.BackgroundColor3 = Color3.fromRGB(38,133,112)
+    end
+    inventoryTab.Activated:Connect(showInventory)
+    manualTab.Activated:Connect(showManual)
+    function api.GetManualRoot() return manualRoot end
     function api.SetStatus(text, success)
         status.Text = "Status: " .. tostring(text)
         status.TextColor3 = success and Color3.fromRGB(120, 230, 150)

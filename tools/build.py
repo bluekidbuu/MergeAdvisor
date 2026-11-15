@@ -9,6 +9,8 @@ MODULES = [
     ("InventoryReader", "src/core/InventoryReader.lua"),
     ("IncomeCalculator", "src/calculators/IncomeCalculator.lua"),
     ("MergeCalculator", "src/calculators/MergeCalculator.lua"),
+    ("MergePreparation", "src/ui/MergePreparation.lua"),
+    ("ManualMergeTab", "src/ui/ManualMergeTab.lua"),
     ("MainWindow", "src/ui/MainWindow.lua"),
     ("Bootstrap", "src/core/Bootstrap.lua"),
 ]
@@ -48,6 +50,8 @@ def build():
         "        InventoryReader = InventoryReader,",
         "        IncomeCalculator = IncomeCalculator,",
         "        MergeCalculator = MergeCalculator,",
+        "        MergePreparation = MergePreparation,",
+        "        ManualMergeTab = ManualMergeTab,",
         "        MainWindow = MainWindow,",
         "    }",
         "})",

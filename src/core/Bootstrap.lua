@@ -123,6 +123,8 @@ function Bootstrap.Start(options)
     local IncomeCalculator = assert(modules.IncomeCalculator, "IncomeCalculator belum dimasukkan")
     local MergeCalculator = assert(modules.MergeCalculator, "MergeCalculator belum dimasukkan")
     local MainWindow = assert(modules.MainWindow, "MainWindow belum dimasukkan")
+    local ManualMergeTab = assert(modules.ManualMergeTab, "ManualMergeTab belum dimasukkan")
+    local MergePreparation = assert(modules.MergePreparation, "MergePreparation belum dimasukkan")
 
     local Players = game:GetService("Players")
     local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -140,6 +142,24 @@ function Bootstrap.Start(options)
         TotalIncome = 0, LastReport = "", Destroyed = false,
         Watcher = nil, Refreshing = false, RefreshQueued = false,
     }
+
+    local manualTab = ManualMergeTab.Create(window.GetManualRoot(), {
+        GetAnimals = function() return controller.Animals end,
+        Evaluate = function(a,b,c) return MergeCalculator.Evaluate(a,b,c,controller.Configs) end,
+        CalculateIncome = function(name,kg,variant,mutation)
+            return IncomeCalculator.CalculateFromGame(controller.Configs,name,nil,mutation,kg,variant,nil)
+        end,
+        Prepare = function(pets,callback)
+            return MergePreparation.Prepare(player,pets,callback,function(name)
+                local rewards=controller.Configs and controller.Configs.EggRewards
+                if rewards and type(rewards.DisplayName)=="function" then
+                    local ok,value=pcall(rewards.DisplayName,name)
+                    if ok and value then return value end
+                end
+                return name
+            end)
+        end,
+    })
 
     local function makeReport(animals, diagnostics, totalIncome, scannedTools, mergeResults, mergeDiagnostics, configs)
         local lines = {
@@ -281,6 +301,7 @@ function Bootstrap.Start(options)
         if type(mergeDiagnostics) ~= "table" then mergeDiagnostics = {} end
 
         controller.Animals = animals
+        manualTab.SetAnimals(animals)
         controller.MergeResults = mergeResults
         controller.Diagnostics = diagnostics
         controller.TotalIncome = totalIncome
@@ -333,6 +354,7 @@ function Bootstrap.Start(options)
         if controller.Watcher and controller.Watcher.Disconnect then
             pcall(function() controller.Watcher.Disconnect() end)
         end
+        manualTab.Destroy()
         window.Destroy()
     end
 
