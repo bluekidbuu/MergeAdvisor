@@ -112,36 +112,27 @@ function MergeCalculator.Evaluate(a, b, c, configs)
 
     local mergeConfig = configs and configs.MergeConfig
     local eggRewards = configs and configs.EggRewards
+
     if type(mergeConfig) ~= "table"
-        or type(mergeConfig.VariantOdds) ~= "function"
-        or type(mergeConfig.MutationOdds) ~= "function"
+        or type(mergeConfig.TraitOdds) ~= "function"
         or type(eggRewards) ~= "table"
         or type(eggRewards.PlacedCashPerSecond) ~= "function" then
-        return nil, "API MergeConfig/EggRewards tidak tersedia"
+        return nil, "API TraitOdds/EggRewards tidak tersedia"
     end
 
     local totalWeight = wa + wb + wc
     local variants = {getVariant(a), getVariant(b), getVariant(c)}
     local mutations = {getMutation(a), getMutation(b), getMutation(c)}
 
-    local okVariant, variantOdds, variantRemain = pcall(
-        mergeConfig.VariantOdds, variants, 3
+    local okOdds, traitOptions = pcall(
+        mergeConfig.TraitOdds, variants, mutations, 3
     )
-    if not okVariant then
-        return nil, "VariantOdds gagal: " .. tostring(variantOdds)
+    if not okOdds then
+        return nil, "TraitOdds gagal: " .. tostring(traitOptions)
     end
 
-    local okMutation, mutationOdds, mutationRemain = pcall(
-        mergeConfig.MutationOdds, mutations, 3
-    )
-    if not okMutation then
-        return nil, "MutationOdds gagal: " .. tostring(mutationOdds)
-    end
-
-    local vOptions = makeVariantOptions(variantOdds, variantRemain)
-    local mOptions = makeMutationOptions(mutationOdds, mutationRemain)
-    if #vOptions == 0 or #mOptions == 0 then
-        return nil, "Odds variant/mutation kosong"
+    if type(traitOptions) ~= "table" then
+        return nil, "TraitOdds tidak mengembalikan tabel distribusi"
     end
 
     local expected = 0
@@ -151,67 +142,129 @@ function MergeCalculator.Evaluate(a, b, c, configs)
     local probabilityTotal = 0
     local failedProbability = 0
 
-    for _, variant in ipairs(vOptions) do
-        for _, mutation in ipairs(mOptions) do
-            local chance = variant.Chance * mutation.Chance
-            if chance > 0 then
-                local ok, income = pcall(
-                    calculateIncome,
-                    configs,
-                    name,
-                    totalWeight,
-                    mutation.Name or nil,
-                    variant.Name or nil
-                )
+    for _, trait in ipairs(traitOptions) do
+        if type(trait) == "table"
+            and type(trait.Chance) == "number"
+            and trait.Chance > 0 then
 
-                if ok and type(income) == "number"
-                    and income == income and income >= 0 then
-                    expected = expected + chance * income
-                    best = math.max(best, income)
-                    worst = math.min(worst, income)
-                    probabilityTotal = probabilityTotal + chance
-                    table.insert(outcomes, {
-                        Variant = variant.Name or "Normal",
-                        Mutation = mutation.Name or "None",
-                        Chance = chance,
-                        Income = income,
-                    })
-                else
-                    failedProbability = failedProbability + chance
-                end
+            -- TraitOdds menggunakan pecahan 0 sampai 1.
+            local chance = trait.Chance
+            if chance > 1 then
+                return nil, "Peluang TraitOdds melebihi 1.0: "
+                    .. tostring(trait.Name)
+            end
+
+            -- SingleTrait menentukan salah satu trait efektif.
+            -- Jangan membuat kombinasi silang Variant x Mutation.
+            local variant = trait.Variant
+            local mutation = trait.Mutation
+
+            local okIncome, income = pcall(
+                calculateIncome,
+                configs,
+                name,
+                totalWeight,
+                mutation,
+                variant
+            )
+
+            if okIncome and type(income) == "number"
+                and income == income and income >= 0 then
+
+                expected = expected + chance * income
+                best = math.max(best, income)
+                worst = math.min(worst, income)
+                probabilityTotal = probabilityTotal + chance
+
+                table.insert(outcomes, {
+                    Name = tostring(trait.Name or "Normal"),
+                    Variant = variant,
+                    Mutation = mutation,
+                    Chance = chance,
+                    Income = income,
+                })
+            else
+                failedProbability = failedProbability + chance
             end
         end
     end
 
-    -- Jangan mengeluarkan rekomendasi jika distribusi odds tidak lengkap.
-    if #outcomes == 0 then
-        return nil, "Tidak ada outcome yang berhasil dihitung"
-    end
     if failedProbability > 0.000001 then
-        return nil, "Sebagian outcome gagal dihitung"
+        return nil, "Sebagian outcome TraitOdds gagal dihitung"
     end
+
+    -- TraitOdds menghilangkan outcome Normal.
+    -- Normal adalah sisa probabilitas dari seluruh trait khusus.
+    local remainingProbability = 1 - probabilityTotal
+
+    if remainingProbability < -0.005 then
+        return nil, string.format(
+            "Total probabilitas trait melebihi 100%%: %.4f%%",
+            probabilityTotal * 100
+        )
+    end
+
+    if remainingProbability > 0.000001 then
+        local okIncome, income = pcall(
+            calculateIncome,
+            configs,
+            name,
+            totalWeight,
+            nil,
+            nil
+        )
+
+        if not okIncome or type(income) ~= "number"
+            or income ~= income or income < 0 then
+            return nil, "Income outcome Normal gagal dihitung: "
+                .. tostring(income)
+        end
+
+        table.insert(outcomes, {
+            Name = "Normal",
+            Variant = nil,
+            Mutation = nil,
+            Chance = remainingProbability,
+            Income = income,
+        })
+
+        probabilityTotal = probabilityTotal + remainingProbability
+    end
+
+    if #outcomes == 0 then
+        return nil, "Tidak ada outcome TraitOdds yang berhasil dihitung"
+    end
+
     if math.abs(probabilityTotal - 1) > 0.005 then
         return nil, string.format(
-            "Total probabilitas tidak valid: %.4f%%",
+            "Total probabilitas TraitOdds tidak valid: %.4f%%",
             probabilityTotal * 100
         )
     end
 
     table.sort(outcomes, function(x, y)
-        if x.Chance == y.Chance then return x.Income > y.Income end
+        if x.Chance == y.Chance then
+            return x.Income > y.Income
+        end
         return x.Chance > y.Chance
     end)
 
     local inputIncome = getIncome(a) + getIncome(b) + getIncome(c)
     local growth = 0
+
     if type(mergeConfig.GrowthSeconds) == "function" then
         local rarity
         if type(eggRewards.RarityOf) == "function" then
             local ok, value = pcall(eggRewards.RarityOf, name)
             if ok then rarity = value end
         end
-        local ok, value = pcall(mergeConfig.GrowthSeconds, totalWeight, rarity)
-        if ok and type(value) == "number" then growth = value end
+
+        local ok, value = pcall(
+            mergeConfig.GrowthSeconds, totalWeight, rarity
+        )
+        if ok and type(value) == "number" then
+            growth = value
+        end
     end
 
     return {
@@ -224,8 +277,7 @@ function MergeCalculator.Evaluate(a, b, c, configs)
         Input = inputIncome,
         Gain = expected - inputIncome,
         Ratio = inputIncome > 0 and expected / inputIncome or 0,
-        VariantOdds = vOptions,
-        MutationOdds = mOptions,
+        TraitOdds = traitOptions,
         Outcomes = outcomes,
         ProbabilityTotal = probabilityTotal,
         FailedProbability = failedProbability,

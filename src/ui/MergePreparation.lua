@@ -44,6 +44,41 @@ local function findRow(list,pet,displayName)
     return found
 end
 
+
+function MergePreparation.OpenMachine(player)
+    local controllers = player:FindFirstChild("PlayerScripts")
+        and player.PlayerScripts:FindFirstChild("Client")
+        and player.PlayerScripts.Client:FindFirstChild("Controllers")
+
+    local module = controllers and controllers:FindFirstChild("UiFrames")
+    if not module then
+        return nil, "UiFrames tidak ditemukan."
+    end
+
+    local ok, api = pcall(require, module)
+    if not ok or type(api) ~= "table"
+        or type(api.Open) ~= "function" then
+        return nil, "Gagal memuat UiFrames.Open."
+    end
+
+    local pg = player:FindFirstChildOfClass("PlayerGui")
+    local main = pg and pg:FindFirstChild("MainGUI")
+    local frames = main and main:FindFirstChild("Frames")
+    local panel = frames and frames:FindFirstChild("MergeMachine")
+
+    if not panel then
+        return nil, "Panel MergeMachine tidak ditemukan."
+    end
+
+    local opened, err = pcall(api.Open, panel)
+    if not opened then
+        return nil, "Gagal membuka panel: " .. tostring(err)
+    end
+
+    task.wait(0.6)
+    return panel
+end
+
 function MergePreparation.Prepare(player,pets,callback,displayName)
     if type(pets)~="table" or #pets~=3 then report(callback,"Tiga hewan wajib dipilih.",false);return false end
     if pets[1].name~=pets[2].name or pets[1].name~=pets[3].name then report(callback,"Spesies ketiga hewan harus sama.",false);return false end
@@ -54,20 +89,11 @@ function MergePreparation.Prepare(player,pets,callback,displayName)
         if used[tool] then report(callback,"Hewan yang sama tidak boleh dipakai dua kali.",false);return false end
         used[tool]=true
     end
-    local controllers=player:FindFirstChild("PlayerScripts") and player.PlayerScripts:FindFirstChild("Client")
-        and player.PlayerScripts.Client:FindFirstChild("Controllers")
-    local module=controllers and controllers:FindFirstChild("UiFrames")
-    if not module then report(callback,"UiFrames tidak ditemukan; buka Merge Machine manual.",false);return false end
-    local ok,api=pcall(require,module)
-    if not ok or type(api)~="table" or type(api.Open)~="function" then report(callback,"Gagal memuat UiFrames.Open.",false);return false end
-    local pg=player:FindFirstChildOfClass("PlayerGui")
-    local main=pg and pg:FindFirstChild("MainGUI")
-    local frames=main and main:FindFirstChild("Frames")
-    local panel=frames and frames:FindFirstChild("MergeMachine")
-    if not panel then report(callback,"Panel MergeMachine tidak ditemukan.",false);return false end
-    local opened,err=pcall(api.Open,panel)
-    if not opened then report(callback,"Gagal membuka panel: "..tostring(err),false);return false end
-    task.wait(0.6)
+    local panel, openErr = MergePreparation.OpenMachine(player)
+    if not panel then
+        report(callback, openErr, false)
+        return false
+    end
     local fusion=panel:FindFirstChild("AnimalFusion")
     local slots=fusion and fusion:FindFirstChild("PetsPlacementList")
     local root=panel:FindFirstChild("ScrollingFrameContainer")

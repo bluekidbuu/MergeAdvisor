@@ -86,8 +86,7 @@ function GameConfigLoader.Load(replicatedStorage)
 
     local requiredFunctions = {
         {modules.EggRewards, "PlacedCashPerSecond"},
-        {modules.MergeConfig, "VariantOdds"},
-        {modules.MergeConfig, "MutationOdds"},
+        {modules.MergeConfig, "TraitOdds"},
     }
 
     for _, item in ipairs(requiredFunctions) do
@@ -746,36 +745,27 @@ function MergeCalculator.Evaluate(a, b, c, configs)
 
     local mergeConfig = configs and configs.MergeConfig
     local eggRewards = configs and configs.EggRewards
+
     if type(mergeConfig) ~= "table"
-        or type(mergeConfig.VariantOdds) ~= "function"
-        or type(mergeConfig.MutationOdds) ~= "function"
+        or type(mergeConfig.TraitOdds) ~= "function"
         or type(eggRewards) ~= "table"
         or type(eggRewards.PlacedCashPerSecond) ~= "function" then
-        return nil, "API MergeConfig/EggRewards tidak tersedia"
+        return nil, "API TraitOdds/EggRewards tidak tersedia"
     end
 
     local totalWeight = wa + wb + wc
     local variants = {getVariant(a), getVariant(b), getVariant(c)}
     local mutations = {getMutation(a), getMutation(b), getMutation(c)}
 
-    local okVariant, variantOdds, variantRemain = pcall(
-        mergeConfig.VariantOdds, variants, 3
+    local okOdds, traitOptions = pcall(
+        mergeConfig.TraitOdds, variants, mutations, 3
     )
-    if not okVariant then
-        return nil, "VariantOdds gagal: " .. tostring(variantOdds)
+    if not okOdds then
+        return nil, "TraitOdds gagal: " .. tostring(traitOptions)
     end
 
-    local okMutation, mutationOdds, mutationRemain = pcall(
-        mergeConfig.MutationOdds, mutations, 3
-    )
-    if not okMutation then
-        return nil, "MutationOdds gagal: " .. tostring(mutationOdds)
-    end
-
-    local vOptions = makeVariantOptions(variantOdds, variantRemain)
-    local mOptions = makeMutationOptions(mutationOdds, mutationRemain)
-    if #vOptions == 0 or #mOptions == 0 then
-        return nil, "Odds variant/mutation kosong"
+    if type(traitOptions) ~= "table" then
+        return nil, "TraitOdds tidak mengembalikan tabel distribusi"
     end
 
     local expected = 0
@@ -785,67 +775,129 @@ function MergeCalculator.Evaluate(a, b, c, configs)
     local probabilityTotal = 0
     local failedProbability = 0
 
-    for _, variant in ipairs(vOptions) do
-        for _, mutation in ipairs(mOptions) do
-            local chance = variant.Chance * mutation.Chance
-            if chance > 0 then
-                local ok, income = pcall(
-                    calculateIncome,
-                    configs,
-                    name,
-                    totalWeight,
-                    mutation.Name or nil,
-                    variant.Name or nil
-                )
+    for _, trait in ipairs(traitOptions) do
+        if type(trait) == "table"
+            and type(trait.Chance) == "number"
+            and trait.Chance > 0 then
 
-                if ok and type(income) == "number"
-                    and income == income and income >= 0 then
-                    expected = expected + chance * income
-                    best = math.max(best, income)
-                    worst = math.min(worst, income)
-                    probabilityTotal = probabilityTotal + chance
-                    table.insert(outcomes, {
-                        Variant = variant.Name or "Normal",
-                        Mutation = mutation.Name or "None",
-                        Chance = chance,
-                        Income = income,
-                    })
-                else
-                    failedProbability = failedProbability + chance
-                end
+            -- TraitOdds menggunakan pecahan 0 sampai 1.
+            local chance = trait.Chance
+            if chance > 1 then
+                return nil, "Peluang TraitOdds melebihi 1.0: "
+                    .. tostring(trait.Name)
+            end
+
+            -- SingleTrait menentukan salah satu trait efektif.
+            -- Jangan membuat kombinasi silang Variant x Mutation.
+            local variant = trait.Variant
+            local mutation = trait.Mutation
+
+            local okIncome, income = pcall(
+                calculateIncome,
+                configs,
+                name,
+                totalWeight,
+                mutation,
+                variant
+            )
+
+            if okIncome and type(income) == "number"
+                and income == income and income >= 0 then
+
+                expected = expected + chance * income
+                best = math.max(best, income)
+                worst = math.min(worst, income)
+                probabilityTotal = probabilityTotal + chance
+
+                table.insert(outcomes, {
+                    Name = tostring(trait.Name or "Normal"),
+                    Variant = variant,
+                    Mutation = mutation,
+                    Chance = chance,
+                    Income = income,
+                })
+            else
+                failedProbability = failedProbability + chance
             end
         end
     end
 
-    -- Jangan mengeluarkan rekomendasi jika distribusi odds tidak lengkap.
-    if #outcomes == 0 then
-        return nil, "Tidak ada outcome yang berhasil dihitung"
-    end
     if failedProbability > 0.000001 then
-        return nil, "Sebagian outcome gagal dihitung"
+        return nil, "Sebagian outcome TraitOdds gagal dihitung"
     end
+
+    -- TraitOdds menghilangkan outcome Normal.
+    -- Normal adalah sisa probabilitas dari seluruh trait khusus.
+    local remainingProbability = 1 - probabilityTotal
+
+    if remainingProbability < -0.005 then
+        return nil, string.format(
+            "Total probabilitas trait melebihi 100%%: %.4f%%",
+            probabilityTotal * 100
+        )
+    end
+
+    if remainingProbability > 0.000001 then
+        local okIncome, income = pcall(
+            calculateIncome,
+            configs,
+            name,
+            totalWeight,
+            nil,
+            nil
+        )
+
+        if not okIncome or type(income) ~= "number"
+            or income ~= income or income < 0 then
+            return nil, "Income outcome Normal gagal dihitung: "
+                .. tostring(income)
+        end
+
+        table.insert(outcomes, {
+            Name = "Normal",
+            Variant = nil,
+            Mutation = nil,
+            Chance = remainingProbability,
+            Income = income,
+        })
+
+        probabilityTotal = probabilityTotal + remainingProbability
+    end
+
+    if #outcomes == 0 then
+        return nil, "Tidak ada outcome TraitOdds yang berhasil dihitung"
+    end
+
     if math.abs(probabilityTotal - 1) > 0.005 then
         return nil, string.format(
-            "Total probabilitas tidak valid: %.4f%%",
+            "Total probabilitas TraitOdds tidak valid: %.4f%%",
             probabilityTotal * 100
         )
     end
 
     table.sort(outcomes, function(x, y)
-        if x.Chance == y.Chance then return x.Income > y.Income end
+        if x.Chance == y.Chance then
+            return x.Income > y.Income
+        end
         return x.Chance > y.Chance
     end)
 
     local inputIncome = getIncome(a) + getIncome(b) + getIncome(c)
     local growth = 0
+
     if type(mergeConfig.GrowthSeconds) == "function" then
         local rarity
         if type(eggRewards.RarityOf) == "function" then
             local ok, value = pcall(eggRewards.RarityOf, name)
             if ok then rarity = value end
         end
-        local ok, value = pcall(mergeConfig.GrowthSeconds, totalWeight, rarity)
-        if ok and type(value) == "number" then growth = value end
+
+        local ok, value = pcall(
+            mergeConfig.GrowthSeconds, totalWeight, rarity
+        )
+        if ok and type(value) == "number" then
+            growth = value
+        end
     end
 
     return {
@@ -858,8 +910,7 @@ function MergeCalculator.Evaluate(a, b, c, configs)
         Input = inputIncome,
         Gain = expected - inputIncome,
         Ratio = inputIncome > 0 and expected / inputIncome or 0,
-        VariantOdds = vOptions,
-        MutationOdds = mOptions,
+        TraitOdds = traitOptions,
         Outcomes = outcomes,
         ProbabilityTotal = probabilityTotal,
         FailedProbability = failedProbability,
@@ -1012,6 +1063,41 @@ local function findRow(list,pet,displayName)
     return found
 end
 
+
+function MergePreparation.OpenMachine(player)
+    local controllers = player:FindFirstChild("PlayerScripts")
+        and player.PlayerScripts:FindFirstChild("Client")
+        and player.PlayerScripts.Client:FindFirstChild("Controllers")
+
+    local module = controllers and controllers:FindFirstChild("UiFrames")
+    if not module then
+        return nil, "UiFrames tidak ditemukan."
+    end
+
+    local ok, api = pcall(require, module)
+    if not ok or type(api) ~= "table"
+        or type(api.Open) ~= "function" then
+        return nil, "Gagal memuat UiFrames.Open."
+    end
+
+    local pg = player:FindFirstChildOfClass("PlayerGui")
+    local main = pg and pg:FindFirstChild("MainGUI")
+    local frames = main and main:FindFirstChild("Frames")
+    local panel = frames and frames:FindFirstChild("MergeMachine")
+
+    if not panel then
+        return nil, "Panel MergeMachine tidak ditemukan."
+    end
+
+    local opened, err = pcall(api.Open, panel)
+    if not opened then
+        return nil, "Gagal membuka panel: " .. tostring(err)
+    end
+
+    task.wait(0.6)
+    return panel
+end
+
 function MergePreparation.Prepare(player,pets,callback,displayName)
     if type(pets)~="table" or #pets~=3 then report(callback,"Tiga hewan wajib dipilih.",false);return false end
     if pets[1].name~=pets[2].name or pets[1].name~=pets[3].name then report(callback,"Spesies ketiga hewan harus sama.",false);return false end
@@ -1022,20 +1108,11 @@ function MergePreparation.Prepare(player,pets,callback,displayName)
         if used[tool] then report(callback,"Hewan yang sama tidak boleh dipakai dua kali.",false);return false end
         used[tool]=true
     end
-    local controllers=player:FindFirstChild("PlayerScripts") and player.PlayerScripts:FindFirstChild("Client")
-        and player.PlayerScripts.Client:FindFirstChild("Controllers")
-    local module=controllers and controllers:FindFirstChild("UiFrames")
-    if not module then report(callback,"UiFrames tidak ditemukan; buka Merge Machine manual.",false);return false end
-    local ok,api=pcall(require,module)
-    if not ok or type(api)~="table" or type(api.Open)~="function" then report(callback,"Gagal memuat UiFrames.Open.",false);return false end
-    local pg=player:FindFirstChildOfClass("PlayerGui")
-    local main=pg and pg:FindFirstChild("MainGUI")
-    local frames=main and main:FindFirstChild("Frames")
-    local panel=frames and frames:FindFirstChild("MergeMachine")
-    if not panel then report(callback,"Panel MergeMachine tidak ditemukan.",false);return false end
-    local opened,err=pcall(api.Open,panel)
-    if not opened then report(callback,"Gagal membuka panel: "..tostring(err),false);return false end
-    task.wait(0.6)
+    local panel, openErr = MergePreparation.OpenMachine(player)
+    if not panel then
+        report(callback, openErr, false)
+        return false
+    end
     local fusion=panel:FindFirstChild("AnimalFusion")
     local slots=fusion and fusion:FindFirstChild("PetsPlacementList")
     local root=panel:FindFirstChild("ScrollingFrameContainer")
@@ -1284,6 +1361,17 @@ function ManualMergeTab.Create(parent,opts)
         BorderSizePixel=0,ScrollBarThickness=4,AutomaticCanvasSize=Enum.AutomaticSize.Y,CanvasSize=UDim2.new(),ZIndex=21},picker)
     local listLayout=Instance.new("UIListLayout",list);listLayout.Padding=UDim.new(0,4)
     local target
+
+    local function getPetImage(p)
+        if type(opts.GetImage) ~= "function" or not p then return "" end
+        local name = p.name or p.AnimalName or p.Name
+        if not name then return "" end
+        local ok,value = pcall(opts.GetImage,name,
+            p.var or p.Variant, p.mut or p.Mutation)
+        if ok and type(value) == "string" then return value end
+        return ""
+    end
+
     local function clearList() for _,v in ipairs(list:GetChildren()) do if v:IsA("GuiObject") and v~=listLayout then v:Destroy() end end end
     local function setSlot(i,p)
         selected[i]=p;local s=slots[i]
@@ -1291,8 +1379,10 @@ function ManualMergeTab.Create(parent,opts)
             s.name.Text=tostring(p.name or p.AnimalName or "");s.kg.Text=tostring(p.kg or p.WeightKg or "")
             s.income.Text=tostring(p.income or p.Income or "");s.variant.Text=tostring(p.var or p.Variant or "Normal")
             s.mutation.Text=tostring(p.mut or p.Mutation or "None");s.source.Text=p.tool and "Inventory" or "Custom"
+            s.image.Image=getPetImage(p)
         else
             s.name.Text="";s.kg.Text="";s.income.Text="";s.variant.Text="";s.mutation.Text="";s.source.Text="Belum dipilih"
+            s.image.Image=""
         end
     end
     local function openPicker(i)
@@ -1300,6 +1390,20 @@ function ManualMergeTab.Create(parent,opts)
         for _,p in ipairs(source or {}) do
             local item=button(list,string.format("%s | %.1f kg | %s",p.name or p.AnimalName,tonumber(p.kg or p.WeightKg) or 0,fmt(p.income or p.Income)),Color3.fromRGB(43,60,84),UDim2.new(1,-5,0,38))
             item.TextWrapped=true;item.TextXAlignment=Enum.TextXAlignment.Left;item.ZIndex=22
+            item.Text="       "..item.Text
+
+            local thumb=make("ImageLabel",{
+                Name="AnimalImage",
+                Position=UDim2.fromOffset(4,3),
+                Size=UDim2.fromOffset(32,32),
+                BackgroundColor3=Color3.fromRGB(24,34,49),
+                BorderSizePixel=0,
+                ScaleType=Enum.ScaleType.Fit,
+                Image=getPetImage(p),
+                ZIndex=23
+            },item)
+            thumb.Active=false
+
             item.Activated:Connect(function()
                 for j,old in pairs(selected) do if j~=i and old and old.tool and old.tool==p.tool then
                     slots[i].source.Text="Sudah dipakai di Slot "..j;return end end
@@ -1313,11 +1417,20 @@ function ManualMergeTab.Create(parent,opts)
         local card=make("Frame",{Size=UDim2.new(1,-4,0,153),BackgroundColor3=Color3.fromRGB(39,53,74),BorderSizePixel=0,LayoutOrder=i},scroll);round(card)
         label(card,"SLOT "..i,10,Color3.fromRGB(255,218,104),18).Position=UDim2.fromOffset(6,2)
         local pick=button(card,"PILIH INVENTORY",Color3.fromRGB(39,128,111),UDim2.new(0.43,-4,0,21));pick.Position=UDim2.new(0.55,0,0,2)
-        local fields=make("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(4,26),Size=UDim2.new(1,-8,0,124)},card)
+        local preview=make("ImageLabel",{
+            Name="AnimalPreview",
+            Position=UDim2.fromOffset(6,30),
+            Size=UDim2.fromOffset(54,54),
+            BackgroundColor3=Color3.fromRGB(24,34,49),
+            BorderSizePixel=0,
+            ScaleType=Enum.ScaleType.Fit
+        },card)
+
+        local fields=make("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(66,26),Size=UDim2.new(1,-70,0,124)},card)
         local grid=Instance.new("UIGridLayout",fields);grid.CellSize=UDim2.new(0.49,-2,0,23);grid.CellPadding=UDim2.new(0.02,0,0,3);grid.FillDirectionMaxCells=2
         local n=box(fields,"Nama spesies");local kg=box(fields,"Berat kg");local inc=box(fields,"Income/s (opsional)")
         local var=box(fields,"Variant");local mut=box(fields,"Mutation");local src=label(fields,"Belum dipilih",8,Color3.fromRGB(164,187,213),20);src.LayoutOrder=6
-        slots[i]={name=n,kg=kg,income=inc,variant=var,mutation=mut,source=src}
+        slots[i]={name=n,kg=kg,income=inc,variant=var,mutation=mut,source=src,image=preview}
         pick.Activated:Connect(function() openPicker(i) end)
     end
     close.Activated:Connect(function() picker.Visible=false end)
@@ -1352,8 +1465,11 @@ function ManualMergeTab.Create(parent,opts)
         local lines={pets[1].name.." | Total "..string.format("%.2f kg",r.WeightKg),
             "Input "..fmt(r.Input).." -> Expected "..fmt(r.Expected),
             "Gain "..fmt(r.Gain).." | Ratio x"..string.format("%.3f",r.Ratio),
-            "Best "..fmt(r.Best).." | Worst "..fmt(r.Worst),"Outcome (peluang Variant x Mutation):"}
-        for _,o in ipairs(r.Outcomes) do table.insert(lines,string.format("%s / %s | %.2f%% | %s",o.Variant,o.Mutation,o.Chance*100,fmt(o.Income))) end
+            "Best "..fmt(r.Best).." | Worst "..fmt(r.Worst),"Outcome Trait (satu trait efektif):"}
+        for _,o in ipairs(r.Outcomes) do
+            table.insert(lines,string.format("%s | %.2f%% | %s",
+                tostring(o.Name or "Normal"),o.Chance*100,fmt(o.Income)))
+        end
         output.Text=table.concat(lines,"\n");output.TextColor3=Color3.fromRGB(126,214,176)
     end)
     clear.Activated:Connect(function() for i=1,3 do setSlot(i,nil) end;output.Text="Slot dikosongkan." end)
@@ -1403,196 +1519,399 @@ end)()
 -- MODULE: src/ui/MainWindow.lua
 local MainWindow = (function()
 -- MainWindow.lua
--- GUI diagnostik dengan output scrollable untuk inventory panjang.
-
+-- Modular GUI: Inventory, Recommendation, Manual Merge.
 local MainWindow = {}
+
+local function make(class, props, parent)
+    local o = Instance.new(class)
+    for k,v in pairs(props or {}) do o[k] = v end
+    o.Parent = parent
+    return o
+end
+
+local function corner(o, radius)
+    Instance.new("UICorner", o).CornerRadius = UDim.new(0, radius or 7)
+end
 
 function MainWindow.Create(playerGui)
     local old = playerGui:FindFirstChild("MergeAdvisorModular")
     if old then old:Destroy() end
 
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "MergeAdvisorModular"
-    gui.ResetOnSpawn = false
-    gui.DisplayOrder = 999
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    gui.Parent = playerGui
+    local gui = make("ScreenGui", {
+        Name="MergeAdvisorModular", ResetOnSpawn=false,
+        DisplayOrder=999, ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+    }, playerGui)
 
-    local frame = Instance.new("Frame")
-    frame.Name = "Main"
-    frame.Size = UDim2.fromOffset(350, 430)
-    frame.Position = UDim2.new(0.5, -175, 0.5, -215)
-    frame.BackgroundColor3 = Color3.fromRGB(23, 26, 34)
-    frame.BorderSizePixel = 0
-    frame.Parent = gui
-    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
-    local stroke = Instance.new("UIStroke", frame)
-    stroke.Color = Color3.fromRGB(65, 76, 96)
-    stroke.Thickness = 1
+    local frame = make("Frame", {
+        Name="Main", Size=UDim2.new(0.94,0,0.84,0),
+        Position=UDim2.fromScale(0.5,0.5), AnchorPoint=Vector2.new(0.5,0.5),
+        BackgroundColor3=Color3.fromRGB(25,32,46), BorderSizePixel=0,
+        ClipsDescendants=true
+    }, gui)
+    corner(frame, 12)
+    local stroke=Instance.new("UIStroke",frame)
+    stroke.Color=Color3.fromRGB(65,105,155)
+    stroke.Thickness=1
 
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -20, 0, 38)
-    title.Position = UDim2.fromOffset(10, 5)
-    title.BackgroundTransparency = 1
-    title.Text = "MERGE ADVISOR"
-    title.TextColor3 = Color3.fromRGB(235, 240, 255)
-    title.Font = Enum.Font.GothamBold
-    title.TextSize = 17
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = frame
+    local header=make("Frame",{
+        Name="Header",Size=UDim2.new(1,0,0,43),
+        BackgroundColor3=Color3.fromRGB(35,105,180),BorderSizePixel=0
+    },frame)
 
-    local status = Instance.new("TextLabel")
-    status.Name = "Status"
-    status.Size = UDim2.new(1, -20, 0, 25)
-    status.Position = UDim2.fromOffset(10, 43)
-    status.BackgroundTransparency = 1
-    status.Text = "Status: Starting..."
-    status.TextColor3 = Color3.fromRGB(255, 205, 100)
-    status.Font = Enum.Font.Gotham
-    status.TextSize = 11
-    status.TextXAlignment = Enum.TextXAlignment.Left
-    status.TextTruncate = Enum.TextTruncate.AtEnd
-    status.Parent = frame
+    make("TextLabel",{
+        Name="Title",Position=UDim2.fromOffset(12,0),
+        Size=UDim2.new(1,-125,1,0),BackgroundTransparency=1,
+        Text="MERGE ADVISOR",TextColor3=Color3.fromRGB(255,225,130),
+        Font=Enum.Font.GothamBold,TextSize=15,
+        TextXAlignment=Enum.TextXAlignment.Left
+    },header)
 
-    local inventoryTab = Instance.new("TextButton")
-    inventoryTab.Name = "InventoryTab"
-    inventoryTab.Position = UDim2.fromOffset(10,72)
-    inventoryTab.Size = UDim2.new(0.5,-6,0,28)
-    inventoryTab.BackgroundColor3 = Color3.fromRGB(38,133,112)
-    inventoryTab.BorderSizePixel = 0
-    inventoryTab.Text = "INVENTORY / REKOMENDASI"
-    inventoryTab.TextColor3 = Color3.new(1,1,1)
-    inventoryTab.Font = Enum.Font.GothamBold
-    inventoryTab.TextSize = 10
-    inventoryTab.Parent = frame
-    Instance.new("UICorner",inventoryTab).CornerRadius = UDim.new(0,6)
-
-    local manualTab = Instance.new("TextButton")
-    manualTab.Name = "ManualTab"
-    manualTab.Position = UDim2.new(0.5,2,0,72)
-    manualTab.Size = UDim2.new(0.5,-12,0,28)
-    manualTab.BackgroundColor3 = Color3.fromRGB(54,75,103)
-    manualTab.BorderSizePixel = 0
-    manualTab.Text = "MANUAL MERGE"
-    manualTab.TextColor3 = Color3.new(1,1,1)
-    manualTab.Font = Enum.Font.GothamBold
-    manualTab.TextSize = 10
-    manualTab.Parent = frame
-    Instance.new("UICorner",manualTab).CornerRadius = UDim.new(0,6)
-
-    local manualRoot = Instance.new("Frame")
-    manualRoot.Name = "ManualRoot"
-    manualRoot.Position = UDim2.fromOffset(10,108)
-    manualRoot.Size = UDim2.new(1,-20,1,-161)
-    manualRoot.BackgroundTransparency = 1
-    manualRoot.Visible = false
-    manualRoot.Parent = frame
-
-    local scroll = Instance.new("ScrollingFrame")
-    scroll.Name = "ReportScroll"
-    scroll.Position = UDim2.fromOffset(10,108)
-    scroll.Size = UDim2.new(1,-20,1,-161)
-    scroll.BackgroundColor3 = Color3.fromRGB(15, 18, 25)
-    scroll.BorderSizePixel = 0
-    scroll.ScrollBarThickness = 5
-    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    scroll.ScrollingDirection = Enum.ScrollingDirection.Y
-    scroll.Parent = frame
-    Instance.new("UICorner", scroll).CornerRadius = UDim.new(0, 6)
-
-    local output = Instance.new("TextLabel")
-    output.Name = "Output"
-    output.BackgroundTransparency = 1
-    output.Position = UDim2.fromOffset(8, 7)
-    output.Size = UDim2.new(1, -16, 0, 0)
-    output.AutomaticSize = Enum.AutomaticSize.Y
-    output.TextColor3 = Color3.fromRGB(215, 225, 240)
-    output.Font = Enum.Font.Code
-    output.TextSize = 11
-    output.TextXAlignment = Enum.TextXAlignment.Left
-    output.TextYAlignment = Enum.TextYAlignment.Top
-    output.TextWrapped = true
-    output.Text = "Menunggu data..."
-    output.Parent = scroll
-
-    local function makeButton(name, text, x, width)
-        local button = Instance.new("TextButton")
-        button.Name = name
-        button.Size = UDim2.new(0, width, 0, 34)
-        button.Position = UDim2.new(0, x, 1, -43)
-        button.BackgroundColor3 = Color3.fromRGB(48, 91, 155)
-        button.BorderSizePixel = 0
-        button.Text = text
-        button.TextColor3 = Color3.new(1, 1, 1)
-        button.Font = Enum.Font.GothamBold
-        button.TextSize = 12
-        button.Parent = frame
-        Instance.new("UICorner", button).CornerRadius = UDim.new(0, 6)
-        return button
+    local function headerButton(name, text, x, color)
+        local b=make("TextButton",{
+            Name=name,Size=UDim2.fromOffset(30,28),
+            Position=UDim2.new(1,x,0,7),BackgroundColor3=color,
+            BorderSizePixel=0,Text=text,TextColor3=Color3.new(1,1,1),
+            Font=Enum.Font.GothamBold,TextSize=16
+        },header)
+        corner(b,6)
+        return b
     end
 
-    local refresh = makeButton("Refresh", "REFRESH", 10, 160)
-    local copy = makeButton("Copy", "COPY REPORT", 180, 160)
+    local expand=headerButton("Expand","↗",-105,Color3.fromRGB(42,135,110))
+    local minimize=headerButton("Minimize","−",-70,Color3.fromRGB(70,85,110))
+    local close=headerButton("Close","×",-35,Color3.fromRGB(160,60,70))
 
-    local UserInputService = game:GetService("UserInputService")
-    local dragging, dragStart, startPosition = false, nil, nil
-    local dragConnections = {}
-    table.insert(dragConnections, title.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            dragStart = input.Position
-            startPosition = frame.Position
+    local floating=make("TextButton",{
+        Name="MergeAdvisorFloatingIcon",Size=UDim2.fromOffset(54,54),
+        Position=UDim2.new(1,-18,1,-90),AnchorPoint=Vector2.new(1,1),
+        BackgroundColor3=Color3.fromRGB(42,115,195),
+        BorderSizePixel=0,Text="🐾",TextSize=24,
+        Visible=false,ZIndex=100
+    },gui)
+    corner(floating,27)
+    local fs=Instance.new("UIStroke",floating)
+    fs.Color=Color3.fromRGB(255,215,110)
+    fs.Thickness=2
+
+    local status=make("TextLabel",{
+        Name="Status",Position=UDim2.fromOffset(10,45),
+        Size=UDim2.new(1,-20,0,22),BackgroundTransparency=1,
+        Text="Status: Starting...",TextColor3=Color3.fromRGB(255,205,110),
+        Font=Enum.Font.Gotham,TextSize=10,
+        TextXAlignment=Enum.TextXAlignment.Left
+    },frame)
+
+    local tabs=make("Frame",{
+        Name="Tabs",Position=UDim2.fromOffset(10,70),
+        Size=UDim2.new(1,-20,0,30),BackgroundTransparency=1
+    },frame)
+
+    local content=make("Frame",{
+        Name="Content",Position=UDim2.fromOffset(10,106),
+        Size=UDim2.new(1,-20,1,-116),
+        BackgroundTransparency=1
+    },frame)
+
+    local pages={}
+    local tabButtons={}
+    local function page(name)
+        local f=make("ScrollingFrame",{
+            Name=name,Size=UDim2.fromScale(1,1),
+            BackgroundColor3=Color3.fromRGB(15,20,30),
+            BorderSizePixel=0,ScrollBarThickness=5,
+            CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y,
+            Visible=false
+        },content)
+        corner(f,7)
+        local layout=Instance.new("UIListLayout",f)
+        layout.Padding=UDim.new(0,5)
+        layout.SortOrder=Enum.SortOrder.LayoutOrder
+        local pad=Instance.new("UIPadding",f)
+        pad.PaddingTop=UDim.new(0,7)
+        pad.PaddingLeft=UDim.new(0,7)
+        pad.PaddingRight=UDim.new(0,7)
+        pad.PaddingBottom=UDim.new(0,7)
+        pages[name]=f
+        return f
+    end
+
+    local inventoryPage=page("InventoryPage")
+    local recommendationPage=page("RecommendationPage")
+    local manualPage=make("Frame",{
+        Name="ManualPage",Size=UDim2.fromScale(1,1),
+        BackgroundTransparency=1,Visible=false
+    },content)
+    pages.ManualPage=manualPage
+
+    local function tab(name,text,x)
+        local b=make("TextButton",{
+            Name=name,Position=UDim2.new(x,0,0,0),
+            Size=UDim2.new(0.333,-5,1,0),
+            BackgroundColor3=Color3.fromRGB(50,70,100),
+            BorderSizePixel=0,Text=text,TextColor3=Color3.new(1,1,1),
+            Font=Enum.Font.GothamBold,TextSize=10
+        },tabs)
+        corner(b,6)
+        tabButtons[name]=b
+        return b
+    end
+
+    local function show(which)
+        for name,p in pairs(pages) do p.Visible=(name==which) end
+        for name,b in pairs(tabButtons) do
+            b.BackgroundColor3=(name==which)
+                and Color3.fromRGB(38,135,110)
+                or Color3.fromRGB(50,70,100)
         end
-    end))
-    table.insert(dragConnections, title.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-            or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
-    end))
-    table.insert(dragConnections, UserInputService.InputChanged:Connect(function(input)
-        if not dragging then return end
-        if input.UserInputType == Enum.UserInputType.MouseMovement
-            or input.UserInputType == Enum.UserInputType.Touch then
-            local delta = input.Position - dragStart
-            frame.Position = UDim2.new(startPosition.X.Scale, startPosition.X.Offset + delta.X,
-                startPosition.Y.Scale, startPosition.Y.Offset + delta.Y)
-        end
-    end))
+    end
 
-    local api = {}
-    local function showInventory()
-        scroll.Visible = true
-        manualRoot.Visible = false
-        inventoryTab.BackgroundColor3 = Color3.fromRGB(38,133,112)
-        manualTab.BackgroundColor3 = Color3.fromRGB(54,75,103)
+    tab("InventoryTab","INVENTORY",0).Activated:Connect(function() show("InventoryPage") end)
+    tab("RecommendationTab","RECOMMENDATION",0.333).Activated:Connect(function() show("RecommendationPage") end)
+    tab("ManualTab","MANUAL MERGE",0.666).Activated:Connect(function() show("ManualPage") end)
+
+    local function clearRows(parent)
+        for _,v in ipairs(parent:GetChildren()) do
+            if v:IsA("GuiObject") and not v:IsA("UIListLayout")
+                and not v:IsA("UIPadding") then v:Destroy() end
+        end
     end
-    local function showManual()
-        scroll.Visible = false
-        manualRoot.Visible = true
-        inventoryTab.BackgroundColor3 = Color3.fromRGB(54,75,103)
-        manualTab.BackgroundColor3 = Color3.fromRGB(38,133,112)
+
+    local function addText(parent,text,height,color,size)
+        return make("TextLabel",{
+            Size=UDim2.new(1,-4,0,height or 30),
+            BackgroundColor3=Color3.fromRGB(34,46,65),
+            BorderSizePixel=0,Text=tostring(text),
+            TextColor3=color or Color3.fromRGB(225,235,248),
+            Font=Enum.Font.Code,TextSize=size or 10,
+            TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,
+            TextYAlignment=Enum.TextYAlignment.Center
+        },parent)
     end
-    inventoryTab.Activated:Connect(showInventory)
-    manualTab.Activated:Connect(showManual)
-    function api.GetManualRoot() return manualRoot end
-    function api.SetStatus(text, success)
-        status.Text = "Status: " .. tostring(text)
-        status.TextColor3 = success and Color3.fromRGB(120, 230, 150)
-            or Color3.fromRGB(255, 190, 100)
+
+    local api={}
+    function api.GetManualRoot() return manualPage end
+
+    function api.SetStatus(text,success)
+        status.Text="Status: "..tostring(text)
+        status.TextColor3=success and Color3.fromRGB(125,230,160)
+            or Color3.fromRGB(255,195,110)
     end
+
     function api.SetText(text)
-        output.Text = tostring(text)
-        scroll.CanvasPosition = Vector2.new(0, 0)
+        clearRows(inventoryPage)
+        local label=addText(inventoryPage,text, math.max(90, math.min(6000, #tostring(text)*0.19)),
+            Color3.fromRGB(220,230,245),10)
+        label.AutomaticSize=Enum.AutomaticSize.Y
+        label.Size=UDim2.new(1,-4,0,0)
+        label.TextYAlignment=Enum.TextYAlignment.Top
+        label.BackgroundTransparency=1
+        label.Position=UDim2.fromOffset(3,3)
+        inventoryPage.CanvasPosition=Vector2.new(0,0)
     end
-    function api.OnRefresh(callback) refresh.Activated:Connect(callback) end
-    function api.OnCopy(callback) copy.Activated:Connect(callback) end
-    function api.Destroy()
-        for _, connection in ipairs(dragConnections) do
-            pcall(function() connection:Disconnect() end)
+
+    function api.SetInventory(animals,getImage,summary)
+        clearRows(inventoryPage)
+
+        addText(inventoryPage, summary or
+            ("INVENTORY  •  " .. tostring(#(animals or {})) .. " hewan"),
+            30, Color3.fromRGB(255,220,120), 12)
+
+        if type(animals) ~= "table" or #animals == 0 then
+            addText(inventoryPage, "Belum ada hewan terbaca.", 42)
+            return
         end
-        gui:Destroy()
+
+        for i,pet in ipairs(animals) do
+            local name = tostring(pet.name or pet.AnimalName or pet.Name or "Unknown")
+            local kg = tonumber(pet.kg or pet.WeightKg) or 0
+            local income = tonumber(pet.income or pet.Income
+                or pet.CashPerSecond or pet.PlacedCashPerSecond) or 0
+            local variant = tostring(pet.var or pet.Variant or "Normal")
+            local mutation = tostring(pet.mut or pet.Mutation or "None")
+
+            local card = make("Frame", {
+                Size = UDim2.new(1,-4,0,66),
+                BackgroundColor3 = Color3.fromRGB(35,49,70),
+                BorderSizePixel = 0,
+                LayoutOrder = i
+            }, inventoryPage)
+            corner(card,7)
+
+            local image = ""
+            if type(getImage) == "function" then
+                local ok,value = pcall(getImage,name,
+                    pet.var or pet.Variant, pet.mut or pet.Mutation)
+                if ok and type(value) == "string" then image = value end
+            end
+
+            make("ImageLabel", {
+                Name = "AnimalImage",
+                Position = UDim2.fromOffset(5,5),
+                Size = UDim2.fromOffset(56,56),
+                BackgroundColor3 = Color3.fromRGB(24,34,49),
+                BorderSizePixel = 0,
+                ScaleType = Enum.ScaleType.Fit,
+                Image = image
+            },card)
+
+            make("TextLabel", {
+                Position = UDim2.fromOffset(68,5),
+                Size = UDim2.new(1,-74,0,21),
+                BackgroundTransparency = 1,
+                Text = name,
+                TextColor3 = Color3.fromRGB(255,220,120),
+                Font = Enum.Font.GothamBold,
+                TextSize = 11,
+                TextXAlignment = Enum.TextXAlignment.Left
+            },card)
+
+            make("TextLabel", {
+                Position = UDim2.fromOffset(68,27),
+                Size = UDim2.new(1,-74,0,32),
+                BackgroundTransparency = 1,
+                Text = string.format("%.1f kg  |  %s/s\n%s  •  %s",
+                    kg, tostring(income), variant, mutation),
+                TextColor3 = Color3.fromRGB(215,228,245),
+                Font = Enum.Font.Code,
+                TextSize = 9,
+                TextWrapped = true,
+                TextXAlignment = Enum.TextXAlignment.Left
+            },card)
+        end
+
+        inventoryPage.CanvasPosition = Vector2.new(0,0)
     end
+
+    function api.SetRecommendations(results,onPick,getImage)
+        clearRows(recommendationPage)
+        addText(recommendationPage,"REKOMENDASI MERGE  •  "..tostring(#(results or {})).." kandidat",30,
+            Color3.fromRGB(255,220,120),12)
+        if not results or #results==0 then
+            addText(recommendationPage,"Belum ada kandidat merge yang memenuhi syarat.",45)
+            return
+        end
+        for i,result in ipairs(results) do
+            local pets=result.Pets or {}
+            local names={}
+            for _,pet in ipairs(pets) do
+                table.insert(names,tostring(pet.AnimalName or pet.Name or pet.name or "Hewan"))
+            end
+            local card=make("Frame",{
+                Size=UDim2.new(1,-4,0,94),
+                BackgroundColor3=Color3.fromRGB(35,49,70),
+                BorderSizePixel=0,LayoutOrder=i
+            },recommendationPage)
+            corner(card,7)
+
+            local firstPet = pets[1]
+            local image = ""
+            if firstPet and type(getImage) == "function" then
+                local petName = firstPet.name or firstPet.AnimalName
+                    or firstPet.Name
+                local ok,value = pcall(getImage,petName,
+                    firstPet.var or firstPet.Variant,
+                    firstPet.mut or firstPet.Mutation)
+                if ok and type(value) == "string" then image = value end
+            end
+
+            make("ImageLabel", {
+                Name = "AnimalImage",
+                Position = UDim2.fromOffset(7,34),
+                Size = UDim2.fromOffset(52,52),
+                BackgroundColor3 = Color3.fromRGB(24,34,49),
+                BorderSizePixel = 0,
+                ScaleType = Enum.ScaleType.Fit,
+                Image = image
+            },card)
+
+            make("TextLabel",{
+                Position=UDim2.fromOffset(66,5),Size=UDim2.new(1,-158,0,23),
+                BackgroundTransparency=1,
+                Text="#"..i.."  "..tostring(result.Name or table.concat(names," / ")),
+                TextColor3=Color3.fromRGB(255,220,120),
+                Font=Enum.Font.GothamBold,TextSize=11,
+                TextXAlignment=Enum.TextXAlignment.Left
+            },card)
+            make("TextLabel",{
+                Position=UDim2.fromOffset(66,29),Size=UDim2.new(1,-158,0,58),
+                BackgroundTransparency=1,
+                Text="Gain: "..tostring(result.Gain).."  |  Ratio: x"..string.format("%.3f",tonumber(result.Ratio) or 0)
+                    .."\nExpected: "..tostring(result.Expected).."  |  Best: "..tostring(result.Best)
+                    .."  |  Worst: "..tostring(result.Worst),
+                TextColor3=Color3.fromRGB(215,228,245),
+                Font=Enum.Font.Code,TextSize=9,TextWrapped=true,
+                TextXAlignment=Enum.TextXAlignment.Left
+            },card)
+            local pick=make("TextButton",{
+                Name="SelectCandidate",Position=UDim2.new(1,-88,0,5),
+                Size=UDim2.fromOffset(80,25),
+                BackgroundColor3=Color3.fromRGB(38,135,110),
+                BorderSizePixel=0,Text="PILIH",
+                TextColor3=Color3.new(1,1,1),
+                Font=Enum.Font.GothamBold,TextSize=10
+            },card)
+            corner(pick,5)
+            pick.MouseButton1Click:Connect(function()
+                if type(onPick)=="function" then
+                    local ok,err=pcall(onPick,result)
+                    if not ok then
+                        warn("[MergeAdvisor] PILIH ERROR: "..tostring(err))
+                    end
+                end
+            end)
+        end
+        recommendationPage.CanvasPosition=Vector2.new(0,0)
+    end
+
+    function api.ShowTab(which)
+        if which=="manual" then show("ManualPage")
+        elseif which=="recommendation" then show("RecommendationPage")
+        else show("InventoryPage") end
+    end
+
+    function api.OnRefresh(callback) end
+    function api.OnCopy(callback) end
+    function api.Destroy() gui:Destroy() end
+
+    local minimized=false
+    local expanded=true
+    local function setMinimized(value)
+        minimized=value
+        frame.Visible=not value
+        floating.Visible=value
+    end
+    minimize.Activated:Connect(function() setMinimized(true) end)
+    close.Activated:Connect(function() setMinimized(true) end)
+    floating.Activated:Connect(function() setMinimized(false) end)
+    expand.Activated:Connect(function()
+        expanded=not expanded
+        frame.Size=expanded and UDim2.new(0.94,0,0.84,0)
+            or UDim2.new(0.82,0,0.70,0)
+        expand.Text=expanded and "↗" or "↙"
+    end)
+
+    local UIS=game:GetService("UserInputService")
+    local dragging,dragStart,startPos=false,nil,nil
+    header.InputBegan:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1
+            or input.UserInputType==Enum.UserInputType.Touch then
+            dragging=true;dragStart=input.Position;startPos=frame.Position
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType==Enum.UserInputType.MouseMovement
+            or input.UserInputType==Enum.UserInputType.Touch) then
+            local d=input.Position-dragStart
+            frame.Position=UDim2.new(startPos.X.Scale,startPos.X.Offset+d.X,
+                startPos.Y.Scale,startPos.Y.Offset+d.Y)
+        end
+    end)
+    UIS.InputEnded:Connect(function(input)
+        if input.UserInputType==Enum.UserInputType.MouseButton1
+            or input.UserInputType==Enum.UserInputType.Touch then dragging=false end
+    end)
+
+    show("InventoryPage")
     return api
 end
 
@@ -1680,9 +1999,11 @@ local function describeMerge(result, rank, configs)
     local sign = result.Gain >= 0 and "+" or "-"
     table.insert(lines, string.format("#%d %s | %s%s | x%.3f",
         rank, result.Name, sign, formatIncome(math.abs(result.Gain)), result.Ratio))
+
     for _, pet in ipairs(result.Pets) do
         table.insert(lines, "  - " .. petDescription(pet))
     end
+
     table.insert(lines, string.format(
         "  Total %.2f kg | Expected %s | Input %s",
         result.WeightKg, formatIncome(result.Expected), formatIncome(result.Input)
@@ -1693,28 +2014,25 @@ local function describeMerge(result, rank, configs)
         formatDuration(result.GrowthSeconds, configs)
     ))
     table.insert(lines, string.format(
-        "  Joint outcomes: %d | Probabilitas termodel: %.2f%%",
+        "  Outcome Trait: %d | Probabilitas termodel: %.2f%%",
         #result.Outcomes, result.ProbabilityTotal * 100
     ))
 
-    table.insert(lines, "  HASIL VARIANT:")
-    for _, option in ipairs(result.VariantOdds) do
+    table.insert(lines, "  DISTRIBUSI TRAIT:")
+    for _, outcome in ipairs(result.Outcomes) do
         table.insert(lines, string.format("    %s: %.2f%%",
-            tostring(option.Name or "Normal"), option.Chance * 100))
-    end
-    table.insert(lines, "  HASIL MUTATION:")
-    for _, option in ipairs(result.MutationOdds) do
-        table.insert(lines, string.format("    %s: %.2f%%",
-            tostring(option.Name or "None"), option.Chance * 100))
+            tostring(outcome.Name or "Normal"), outcome.Chance * 100))
     end
 
     table.insert(lines, "  OUTCOME TERATAS:")
     for index = 1, math.min(6, #result.Outcomes) do
         local outcome = result.Outcomes[index]
-        table.insert(lines, string.format("    %s / %s | %.2f%% | %s",
-            tostring(outcome.Variant), tostring(outcome.Mutation),
-            outcome.Chance * 100, formatIncome(outcome.Income)))
+        table.insert(lines, string.format("    %s | %.2f%% | %s",
+            tostring(outcome.Name or "Normal"),
+            outcome.Chance * 100,
+            formatIncome(outcome.Income)))
     end
+
     return table.concat(lines, "\n")
 end
 
@@ -1749,6 +2067,13 @@ function Bootstrap.Start(options)
 
     local manualTab = ManualMergeTab.Create(window.GetManualRoot(), {
         GetAnimals = function() return controller.Animals end,
+        GetImage = function(name,variant,mutation)
+            local renders = controller.Configs and controller.Configs.AnimalRenders
+            if renders and type(renders.GetImage) == "function" then
+                return renders.GetImage(name,variant,mutation)
+            end
+            return ""
+        end,
         Evaluate = function(a,b,c) return MergeCalculator.Evaluate(a,b,c,controller.Configs) end,
         CalculateIncome = function(name,kg,variant,mutation)
             return IncomeCalculator.CalculateFromGame(controller.Configs,name,nil,mutation,kg,variant,nil)
@@ -1764,6 +2089,11 @@ function Bootstrap.Start(options)
             end)
         end,
         ReadMachine = function()
+            local panel, openErr = MergePreparation.OpenMachine(player)
+            if not panel then
+                return nil, openErr
+            end
+
             return MachineSlotReader.Read(player, controller.Animals, function(name,kg,variant,mutation,size,enchant)
                 return IncomeCalculator.CalculateFromGame(
                     controller.Configs,name,size,mutation,kg,variant,enchant
@@ -1914,6 +2244,45 @@ function Bootstrap.Start(options)
         controller.Animals = animals
         manualTab.SetAnimals(animals)
         controller.MergeResults = mergeResults
+        window.SetRecommendations(mergeResults, function(result)
+            window.SetStatus("PILIH terdeteksi. Membuka Merge Machine...", false)
+
+            local pets = result and result.Pets
+            if type(pets) ~= "table" or #pets ~= 3 then
+                window.SetStatus("GAGAL: kandidat tidak memiliki tepat 3 hewan.", false)
+                return
+            end
+
+            local ok,success = pcall(function()
+                return MergePreparation.Prepare(player, pets, function(msg, good)
+                    window.SetStatus(msg, good)
+                end, function(name)
+                    local rewards = controller.Configs and controller.Configs.EggRewards
+                    if rewards and type(rewards.DisplayName) == "function" then
+                        local displayOK, value = pcall(rewards.DisplayName, name)
+                        if displayOK and value then return value end
+                    end
+                    return name
+                end)
+            end)
+
+            if not ok then
+                window.SetStatus("PREPARATION ERROR: " .. tostring(success), false)
+                return
+            end
+
+            if success == true then
+                window.SetStatus("BERHASIL: 3/3 slot Merge Machine siap. MERGE tidak disentuh.", true)
+            elseif success == false then
+                window.SetStatus("Persiapan gagal. Periksa pesan diagnostik.", false)
+            end
+        end, function(name,variant,mutation)
+            local renders = configs and configs.AnimalRenders
+            if renders and type(renders.GetImage) == "function" then
+                return renders.GetImage(name,variant,mutation)
+            end
+            return ""
+        end)
         controller.Diagnostics = diagnostics
         controller.TotalIncome = totalIncome
         local report = makeReport(
@@ -1922,6 +2291,13 @@ function Bootstrap.Start(options)
         )
         controller.LastReport = report
         window.SetText(report)
+        window.SetInventory(animals, function(name,variant,mutation)
+            local renders = configs and configs.AnimalRenders
+            if renders and type(renders.GetImage) == "function" then
+                return renders.GetImage(name,variant,mutation)
+            end
+            return ""
+        end, "INVENTORY  •  " .. #animals .. " hewan  •  TOTAL INCOME: " .. formatIncome(totalIncome))
         window.SetStatus("Selesai - " .. #animals .. " hewan | "
             .. #mergeResults .. " rekomendasi", true)
         controller.Refreshing = false

@@ -77,9 +77,11 @@ local function describeMerge(result, rank, configs)
     local sign = result.Gain >= 0 and "+" or "-"
     table.insert(lines, string.format("#%d %s | %s%s | x%.3f",
         rank, result.Name, sign, formatIncome(math.abs(result.Gain)), result.Ratio))
+
     for _, pet in ipairs(result.Pets) do
         table.insert(lines, "  - " .. petDescription(pet))
     end
+
     table.insert(lines, string.format(
         "  Total %.2f kg | Expected %s | Input %s",
         result.WeightKg, formatIncome(result.Expected), formatIncome(result.Input)
@@ -90,28 +92,25 @@ local function describeMerge(result, rank, configs)
         formatDuration(result.GrowthSeconds, configs)
     ))
     table.insert(lines, string.format(
-        "  Joint outcomes: %d | Probabilitas termodel: %.2f%%",
+        "  Outcome Trait: %d | Probabilitas termodel: %.2f%%",
         #result.Outcomes, result.ProbabilityTotal * 100
     ))
 
-    table.insert(lines, "  HASIL VARIANT:")
-    for _, option in ipairs(result.VariantOdds) do
+    table.insert(lines, "  DISTRIBUSI TRAIT:")
+    for _, outcome in ipairs(result.Outcomes) do
         table.insert(lines, string.format("    %s: %.2f%%",
-            tostring(option.Name or "Normal"), option.Chance * 100))
-    end
-    table.insert(lines, "  HASIL MUTATION:")
-    for _, option in ipairs(result.MutationOdds) do
-        table.insert(lines, string.format("    %s: %.2f%%",
-            tostring(option.Name or "None"), option.Chance * 100))
+            tostring(outcome.Name or "Normal"), outcome.Chance * 100))
     end
 
     table.insert(lines, "  OUTCOME TERATAS:")
     for index = 1, math.min(6, #result.Outcomes) do
         local outcome = result.Outcomes[index]
-        table.insert(lines, string.format("    %s / %s | %.2f%% | %s",
-            tostring(outcome.Variant), tostring(outcome.Mutation),
-            outcome.Chance * 100, formatIncome(outcome.Income)))
+        table.insert(lines, string.format("    %s | %.2f%% | %s",
+            tostring(outcome.Name or "Normal"),
+            outcome.Chance * 100,
+            formatIncome(outcome.Income)))
     end
+
     return table.concat(lines, "\n")
 end
 
@@ -146,6 +145,13 @@ function Bootstrap.Start(options)
 
     local manualTab = ManualMergeTab.Create(window.GetManualRoot(), {
         GetAnimals = function() return controller.Animals end,
+        GetImage = function(name,variant,mutation)
+            local renders = controller.Configs and controller.Configs.AnimalRenders
+            if renders and type(renders.GetImage) == "function" then
+                return renders.GetImage(name,variant,mutation)
+            end
+            return ""
+        end,
         Evaluate = function(a,b,c) return MergeCalculator.Evaluate(a,b,c,controller.Configs) end,
         CalculateIncome = function(name,kg,variant,mutation)
             return IncomeCalculator.CalculateFromGame(controller.Configs,name,nil,mutation,kg,variant,nil)
@@ -161,6 +167,11 @@ function Bootstrap.Start(options)
             end)
         end,
         ReadMachine = function()
+            local panel, openErr = MergePreparation.OpenMachine(player)
+            if not panel then
+                return nil, openErr
+            end
+
             return MachineSlotReader.Read(player, controller.Animals, function(name,kg,variant,mutation,size,enchant)
                 return IncomeCalculator.CalculateFromGame(
                     controller.Configs,name,size,mutation,kg,variant,enchant
@@ -311,6 +322,45 @@ function Bootstrap.Start(options)
         controller.Animals = animals
         manualTab.SetAnimals(animals)
         controller.MergeResults = mergeResults
+        window.SetRecommendations(mergeResults, function(result)
+            window.SetStatus("PILIH terdeteksi. Membuka Merge Machine...", false)
+
+            local pets = result and result.Pets
+            if type(pets) ~= "table" or #pets ~= 3 then
+                window.SetStatus("GAGAL: kandidat tidak memiliki tepat 3 hewan.", false)
+                return
+            end
+
+            local ok,success = pcall(function()
+                return MergePreparation.Prepare(player, pets, function(msg, good)
+                    window.SetStatus(msg, good)
+                end, function(name)
+                    local rewards = controller.Configs and controller.Configs.EggRewards
+                    if rewards and type(rewards.DisplayName) == "function" then
+                        local displayOK, value = pcall(rewards.DisplayName, name)
+                        if displayOK and value then return value end
+                    end
+                    return name
+                end)
+            end)
+
+            if not ok then
+                window.SetStatus("PREPARATION ERROR: " .. tostring(success), false)
+                return
+            end
+
+            if success == true then
+                window.SetStatus("BERHASIL: 3/3 slot Merge Machine siap. MERGE tidak disentuh.", true)
+            elseif success == false then
+                window.SetStatus("Persiapan gagal. Periksa pesan diagnostik.", false)
+            end
+        end, function(name,variant,mutation)
+            local renders = configs and configs.AnimalRenders
+            if renders and type(renders.GetImage) == "function" then
+                return renders.GetImage(name,variant,mutation)
+            end
+            return ""
+        end)
         controller.Diagnostics = diagnostics
         controller.TotalIncome = totalIncome
         local report = makeReport(
@@ -319,6 +369,13 @@ function Bootstrap.Start(options)
         )
         controller.LastReport = report
         window.SetText(report)
+        window.SetInventory(animals, function(name,variant,mutation)
+            local renders = configs and configs.AnimalRenders
+            if renders and type(renders.GetImage) == "function" then
+                return renders.GetImage(name,variant,mutation)
+            end
+            return ""
+        end, "INVENTORY  •  " .. #animals .. " hewan  •  TOTAL INCOME: " .. formatIncome(totalIncome))
         window.SetStatus("Selesai - " .. #animals .. " hewan | "
             .. #mergeResults .. " rekomendasi", true)
         controller.Refreshing = false

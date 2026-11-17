@@ -50,6 +50,17 @@ function ManualMergeTab.Create(parent,opts)
         BorderSizePixel=0,ScrollBarThickness=4,AutomaticCanvasSize=Enum.AutomaticSize.Y,CanvasSize=UDim2.new(),ZIndex=21},picker)
     local listLayout=Instance.new("UIListLayout",list);listLayout.Padding=UDim.new(0,4)
     local target
+
+    local function getPetImage(p)
+        if type(opts.GetImage) ~= "function" or not p then return "" end
+        local name = p.name or p.AnimalName or p.Name
+        if not name then return "" end
+        local ok,value = pcall(opts.GetImage,name,
+            p.var or p.Variant, p.mut or p.Mutation)
+        if ok and type(value) == "string" then return value end
+        return ""
+    end
+
     local function clearList() for _,v in ipairs(list:GetChildren()) do if v:IsA("GuiObject") and v~=listLayout then v:Destroy() end end end
     local function setSlot(i,p)
         selected[i]=p;local s=slots[i]
@@ -57,8 +68,10 @@ function ManualMergeTab.Create(parent,opts)
             s.name.Text=tostring(p.name or p.AnimalName or "");s.kg.Text=tostring(p.kg or p.WeightKg or "")
             s.income.Text=tostring(p.income or p.Income or "");s.variant.Text=tostring(p.var or p.Variant or "Normal")
             s.mutation.Text=tostring(p.mut or p.Mutation or "None");s.source.Text=p.tool and "Inventory" or "Custom"
+            s.image.Image=getPetImage(p)
         else
             s.name.Text="";s.kg.Text="";s.income.Text="";s.variant.Text="";s.mutation.Text="";s.source.Text="Belum dipilih"
+            s.image.Image=""
         end
     end
     local function openPicker(i)
@@ -66,6 +79,20 @@ function ManualMergeTab.Create(parent,opts)
         for _,p in ipairs(source or {}) do
             local item=button(list,string.format("%s | %.1f kg | %s",p.name or p.AnimalName,tonumber(p.kg or p.WeightKg) or 0,fmt(p.income or p.Income)),Color3.fromRGB(43,60,84),UDim2.new(1,-5,0,38))
             item.TextWrapped=true;item.TextXAlignment=Enum.TextXAlignment.Left;item.ZIndex=22
+            item.Text="       "..item.Text
+
+            local thumb=make("ImageLabel",{
+                Name="AnimalImage",
+                Position=UDim2.fromOffset(4,3),
+                Size=UDim2.fromOffset(32,32),
+                BackgroundColor3=Color3.fromRGB(24,34,49),
+                BorderSizePixel=0,
+                ScaleType=Enum.ScaleType.Fit,
+                Image=getPetImage(p),
+                ZIndex=23
+            },item)
+            thumb.Active=false
+
             item.Activated:Connect(function()
                 for j,old in pairs(selected) do if j~=i and old and old.tool and old.tool==p.tool then
                     slots[i].source.Text="Sudah dipakai di Slot "..j;return end end
@@ -79,11 +106,20 @@ function ManualMergeTab.Create(parent,opts)
         local card=make("Frame",{Size=UDim2.new(1,-4,0,153),BackgroundColor3=Color3.fromRGB(39,53,74),BorderSizePixel=0,LayoutOrder=i},scroll);round(card)
         label(card,"SLOT "..i,10,Color3.fromRGB(255,218,104),18).Position=UDim2.fromOffset(6,2)
         local pick=button(card,"PILIH INVENTORY",Color3.fromRGB(39,128,111),UDim2.new(0.43,-4,0,21));pick.Position=UDim2.new(0.55,0,0,2)
-        local fields=make("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(4,26),Size=UDim2.new(1,-8,0,124)},card)
+        local preview=make("ImageLabel",{
+            Name="AnimalPreview",
+            Position=UDim2.fromOffset(6,30),
+            Size=UDim2.fromOffset(54,54),
+            BackgroundColor3=Color3.fromRGB(24,34,49),
+            BorderSizePixel=0,
+            ScaleType=Enum.ScaleType.Fit
+        },card)
+
+        local fields=make("Frame",{BackgroundTransparency=1,Position=UDim2.fromOffset(66,26),Size=UDim2.new(1,-70,0,124)},card)
         local grid=Instance.new("UIGridLayout",fields);grid.CellSize=UDim2.new(0.49,-2,0,23);grid.CellPadding=UDim2.new(0.02,0,0,3);grid.FillDirectionMaxCells=2
         local n=box(fields,"Nama spesies");local kg=box(fields,"Berat kg");local inc=box(fields,"Income/s (opsional)")
         local var=box(fields,"Variant");local mut=box(fields,"Mutation");local src=label(fields,"Belum dipilih",8,Color3.fromRGB(164,187,213),20);src.LayoutOrder=6
-        slots[i]={name=n,kg=kg,income=inc,variant=var,mutation=mut,source=src}
+        slots[i]={name=n,kg=kg,income=inc,variant=var,mutation=mut,source=src,image=preview}
         pick.Activated:Connect(function() openPicker(i) end)
     end
     close.Activated:Connect(function() picker.Visible=false end)
@@ -118,8 +154,11 @@ function ManualMergeTab.Create(parent,opts)
         local lines={pets[1].name.." | Total "..string.format("%.2f kg",r.WeightKg),
             "Input "..fmt(r.Input).." -> Expected "..fmt(r.Expected),
             "Gain "..fmt(r.Gain).." | Ratio x"..string.format("%.3f",r.Ratio),
-            "Best "..fmt(r.Best).." | Worst "..fmt(r.Worst),"Outcome (peluang Variant x Mutation):"}
-        for _,o in ipairs(r.Outcomes) do table.insert(lines,string.format("%s / %s | %.2f%% | %s",o.Variant,o.Mutation,o.Chance*100,fmt(o.Income))) end
+            "Best "..fmt(r.Best).." | Worst "..fmt(r.Worst),"Outcome Trait (satu trait efektif):"}
+        for _,o in ipairs(r.Outcomes) do
+            table.insert(lines,string.format("%s | %.2f%% | %s",
+                tostring(o.Name or "Normal"),o.Chance*100,fmt(o.Income)))
+        end
         output.Text=table.concat(lines,"\n");output.TextColor3=Color3.fromRGB(126,214,176)
     end)
     clear.Activated:Connect(function() for i=1,3 do setSlot(i,nil) end;output.Text="Slot dikosongkan." end)

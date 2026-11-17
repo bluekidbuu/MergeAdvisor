@@ -80,8 +80,7 @@ function GameConfigLoader.Load(replicatedStorage)
 
     local requiredFunctions = {
         {modules.EggRewards, "PlacedCashPerSecond"},
-        {modules.MergeConfig, "VariantOdds"},
-        {modules.MergeConfig, "MutationOdds"},
+        {modules.MergeConfig, "TraitOdds"},
     }
 
     for _, item in ipairs(requiredFunctions) do
